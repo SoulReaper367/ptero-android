@@ -142,9 +142,9 @@ class ServersViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private suspend fun refreshAllResources() {
+    private suspend fun refreshAllResources() = coroutineScope {
         val current = _uiState.value.servers
-        if (current.isEmpty()) return
+        if (current.isEmpty()) return@coroutineScope
 
         val updated = current.map { uiServer ->
             async(Dispatchers.IO) {
