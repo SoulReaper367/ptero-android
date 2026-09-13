@@ -32,9 +32,9 @@ interface PterodactylApi {
      * Lists all servers accessible by the API key.
      * Requests the allocations relationship so we get IP/port data in one call.
      */
-    @GET("servers?include=allocations&per_page=50&page={page}")
+    @GET("servers?include=allocations&per_page=50")
     suspend fun listServers(
-        @Path("page") page: Int = 1
+        @Query("page") page: Int = 1
     ): Response<ServerListResponse>
 
     /**
