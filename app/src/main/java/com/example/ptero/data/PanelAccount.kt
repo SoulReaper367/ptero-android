@@ -3,21 +3,41 @@ package com.example.ptero.data
 import com.google.gson.annotations.SerializedName
 
 /**
- * Represents a single Pterodactyl panel connection.
- * Up to 4 panel accounts are supported simultaneously.
+ * Represents a single Pterodactyl panel connection stored in SecureStorage.
+ *
+ * [serverId] is an optional 8-character Pterodactyl short identifier (e.g. "a1b2c3d4").
+ * When set the app fetches ONLY that server via GET /api/client/servers/{identifier}
+ * instead of listing all account servers. This is useful for hosting providers that
+ * issue scoped API keys or for users who manage a single known server.
+ *
+ * Backward-compat note: existing JSON blobs without "server_id" will deserialise fine
+ * because Gson leaves missing nullable fields as null.
  */
 data class PanelAccount(
-    val id: String,           // Unique local UUID
-    val label: String,        // Display name, e.g. "Host 1"
-    val panelUrl: String,     // https://panel.example.com
-    val apiKey: String        // ptlc_xxxxxxxxxxxxxxxx
-)
+    val id: String,               // Unique local UUID generated on creation
+    val label: String,            // Display name shown in the UI, e.g. "Host 1"
+    val panelUrl: String,         // https://panel.example.com  (no trailing slash)
+    val apiKey: String,           // ptlc_xxxxxxxxxxxxxxxx
+    val serverId: String? = null  // Optional 8-char server short ID to pin a specific server
+) {
+    /** True when this account is pinned to a single server identifier. */
+    val isPinned: Boolean get() = !serverId.isNullOrBlank()
+}
 
 // ─── Pterodactyl API response models ─────────────────────────────────────────
 
 data class ServerListResponse(
     @SerializedName("data") val data: List<ServerWrapper>,
     @SerializedName("meta") val meta: PaginationMeta?
+)
+
+/**
+ * Single-server response returned by GET /api/client/servers/{identifier}.
+ * The shape is the same object-wrapper the list endpoint uses per-item.
+ */
+data class SingleServerResponse(
+    @SerializedName("object") val `object`: String,
+    @SerializedName("attributes") val attributes: ServerAttributes
 )
 
 data class ServerWrapper(
@@ -44,14 +64,14 @@ data class ServerAttributes(
     @SerializedName("is_installing") val isInstalling: Boolean,
     @SerializedName("relationships") val relationships: ServerRelationships?
 ) {
-    // Resolved at runtime from ResourceUsage
+    // Resolved at runtime from ResourceUsage or injected after fetch
     var currentCpu: Double = 0.0
     var currentMemoryBytes: Long = 0L
     var currentDiskBytes: Long = 0L
-    var serverStatus: String = "offline"   // offline | starting | running | stopping
-    var panelAccountId: String = ""        // injected after fetch
-    var panelLabel: String = ""            // injected after fetch — "Host 1" etc.
-    var allocationDisplay: String = ""     // "192.168.1.1:25565"
+    var serverStatus: String = "offline"  // offline | starting | running | stopping
+    var panelAccountId: String = ""       // injected after fetch
+    var panelLabel: String = ""           // injected after fetch — "Host 1" etc.
+    var allocationDisplay: String = ""    // "192.168.1.1:25565"
 }
 
 data class SftpDetails(
@@ -60,11 +80,11 @@ data class SftpDetails(
 )
 
 data class ServerLimits(
-    @SerializedName("memory") val memory: Long,   // MB
+    @SerializedName("memory") val memory: Long,  // MB
     @SerializedName("swap") val swap: Long,
-    @SerializedName("disk") val disk: Long,        // MB
+    @SerializedName("disk") val disk: Long,       // MB
     @SerializedName("io") val io: Int,
-    @SerializedName("cpu") val cpu: Int            // %
+    @SerializedName("cpu") val cpu: Int           // %
 )
 
 data class FeatureLimits(
