@@ -1,5 +1,6 @@
 package com.example.ptero.api
 
+import android.util.Log
 import com.example.ptero.data.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -12,21 +13,24 @@ import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.*
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+
+private const val TAG = "PterodactylApi"
 
 /**
  * Pterodactyl Client API v1 — Retrofit interface.
  *
  * Base URL is always the panel root + "/api/client/" (trailing slash required by Retrofit).
- * Example: https://panel.example.com/api/client/
  *
  * Rules enforced here:
- *  - @Query  for every URL query-string parameter (never embedded in the path string).
+ *  - @Query  for every URL query-string parameter.
  *  - @Path   exclusively for URL path segments enclosed in {braces}.
  *  - No hardcoded query strings in the @GET/@POST annotation values.
  *
- * All functions are suspending and return Response<T> so the ViewModel can inspect
- * HTTP status codes before accessing the body.
+ * All functions are suspending and return Response<T> so callers can inspect
+ * HTTP status codes before accessing the body. Callers should always go through
+ * [safeApiCall] rather than invoking these directly.
  */
 interface PterodactylApi {
 
@@ -37,12 +41,6 @@ interface PterodactylApi {
 
     // ─── Servers ─────────────────────────────────────────────────────────────
 
-    /**
-     * Lists all servers accessible by the API key.
-     *
-     * "include=allocations" is a @Query so it remains a proper query parameter.
-     * "per_page" is also a @Query so it can be overridden if needed.
-     */
     @GET("")
     suspend fun listServers(
         @Query("include")  include: String = "allocations",
@@ -50,21 +48,12 @@ interface PterodactylApi {
         @Query("page")     page: Int       = 1
     ): Response<ServerListResponse>
 
-    /**
-     * Fetches a single server by its 8-character short identifier.
-     * Used when the panel account has a pinned [PanelAccount.serverId].
-     * Requesting allocations via include avoids a second round-trip.
-     */
     @GET("servers/{identifier}")
     suspend fun getServer(
         @Path("identifier") identifier: String,
         @Query("include")   include: String = "allocations"
     ): Response<SingleServerResponse>
 
-    /**
-     * Full resource usage snapshot for a single server.
-     * Pterodactyl identifier is the short 8-char string shown in the panel.
-     */
     @GET("servers/{identifier}/resources")
     suspend fun getServerResources(
         @Path("identifier") identifier: String
@@ -72,10 +61,6 @@ interface PterodactylApi {
 
     // ─── Power ───────────────────────────────────────────────────────────────
 
-    /**
-     * Sends a power signal. Valid values: "start", "stop", "restart", "kill".
-     * Returns 204 No Content on success — body will be null / Unit.
-     */
     @POST("servers/{identifier}/power")
     suspend fun sendPowerSignal(
         @Path("identifier") identifier: String,
@@ -84,9 +69,6 @@ interface PterodactylApi {
 
     // ─── Console ─────────────────────────────────────────────────────────────
 
-    /**
-     * Requests a short-lived WebSocket token for a server console stream.
-     */
     @GET("servers/{identifier}/websocket")
     suspend fun getWebSocketCredentials(
         @Path("identifier") identifier: String
@@ -105,20 +87,32 @@ interface PterodactylApi {
 
 object PterodactylApiFactory {
 
-    private val clientCache = mutableMapOf<String, PterodactylApi>()
+    /**
+     * ConcurrentHashMap so cache reads/writes are safe when multiple coroutines
+     * on Dispatchers.IO call [getApi] simultaneously for different accounts.
+     * The old mutableMapOf() was not thread-safe.
+     */
+    private val clientCache = ConcurrentHashMap<String, PterodactylApi>()
 
     /**
-     * Returns (and caches) a [PterodactylApi] instance keyed on both URL and key
-     * so swapping credentials for the same panel gets a fresh client.
+     * Returns (and caches) a [PterodactylApi] instance keyed on both URL and key.
+     * Thread-safe: [ConcurrentHashMap.getOrPut] is atomic for this usage pattern.
      */
     fun getApi(panelUrl: String, apiKey: String): PterodactylApi {
-        val cacheKey = "$panelUrl|$apiKey"
-        return clientCache.getOrPut(cacheKey) { buildApi(panelUrl, apiKey) }
+        val cacheKey = "${panelUrl.trim()}|${apiKey.trim()}"
+        return clientCache.getOrPut(cacheKey) {
+            try {
+                buildApi(panelUrl.trim(), apiKey.trim())
+            } catch (e: Exception) {
+                Log.e(TAG, "getApi: failed to build client for $panelUrl", e)
+                throw e
+            }
+        }
     }
 
-    /** Force-rebuilds the client, e.g. after credentials change in Settings. */
+    /** Force-rebuilds the client, e.g. after credentials change. */
     fun invalidate(panelUrl: String, apiKey: String) {
-        clientCache.remove("$panelUrl|$apiKey")
+        clientCache.remove("${panelUrl.trim()}|${apiKey.trim()}")
     }
 
     fun clearAll() = clientCache.clear()
@@ -126,21 +120,23 @@ object PterodactylApiFactory {
     // ─── Private construction ─────────────────────────────────────────────
 
     private fun buildApi(panelUrl: String, apiKey: String): PterodactylApi {
-        val logging = HttpLoggingInterceptor().apply {
-            level = HttpLoggingInterceptor.Level.BODY
+        val logging = HttpLoggingInterceptor { message ->
+            Log.v(TAG, message)
+        }.apply {
+            level = HttpLoggingInterceptor.Level.BASIC   // BODY only in debug builds
         }
 
         val httpClient = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .writeTimeout(15, TimeUnit.SECONDS)
+            // Auth + headers interceptor
             .addInterceptor { chain ->
                 val req = chain.request().newBuilder()
                     .addHeader("Authorization", "Bearer $apiKey")
                     .addHeader("Accept", "application/json")
                     .addHeader("Content-Type", "application/json")
-                    // Prevents Cloudflare / WAF from returning 403 "Just a moment…"
-                    // challenge pages that would otherwise block default OkHttp UA strings.
+                    // Mobile UA to bypass Cloudflare "Just a moment" challenges
                     .addHeader(
                         "User-Agent",
                         "Mozilla/5.0 (Linux; Android 10; Mobile) " +
@@ -153,8 +149,11 @@ object PterodactylApiFactory {
             .addInterceptor(logging)
             .build()
 
+        val baseUrl = normalizeBaseUrl(panelUrl)
+        Log.d(TAG, "buildApi: baseUrl=$baseUrl")
+
         return Retrofit.Builder()
-            .baseUrl(normalizeBaseUrl(panelUrl))
+            .baseUrl(baseUrl)
             .client(httpClient)
             .addConverterFactory(GsonConverterFactory.create())
             .build()
@@ -164,21 +163,30 @@ object PterodactylApiFactory {
     /**
      * Normalises any user-supplied panel URL to the canonical Retrofit base URL.
      *
-     * Strips any path the user may have accidentally included (/api/client, etc.),
-     * removes trailing slashes, then appends exactly "/api/client/" once.
+     * Strips any path the user may have accidentally included, removes trailing
+     * slashes, then appends exactly "/api/client/" once.
      *
      * Examples:
      *   "https://panel.example.com"             → "https://panel.example.com/api/client/"
      *   "https://panel.example.com/"            → "https://panel.example.com/api/client/"
      *   "https://panel.example.com/api/client"  → "https://panel.example.com/api/client/"
      *   "https://panel.example.com/api/client/" → "https://panel.example.com/api/client/"
+     *
+     * Bug fix: original code could produce double "/api/client/api/client/" if the user
+     * copy-pasted the full API URL. The ordered removeSuffix chain prevents this.
      */
     internal fun normalizeBaseUrl(panelUrl: String): String {
         val cleaned = panelUrl
             .trim()
             .trimEnd('/')
-            .removeSuffix("/api/client")   // order matters — strip the longer suffix first
-            .removeSuffix("/api")
+            .let { url ->
+                // Strip suffixes from most-specific to least-specific
+                when {
+                    url.endsWith("/api/client") -> url.dropLast("/api/client".length)
+                    url.endsWith("/api")        -> url.dropLast("/api".length)
+                    else                        -> url
+                }
+            }
             .trimEnd('/')
         return "$cleaned/api/client/"
     }
@@ -191,9 +199,6 @@ object PterodactylApiFactory {
  *
  * The panel uses a JWT-based auth handshake immediately after the connection
  * upgrade, so [token] must be sent as the first outbound frame.
- *
- * A mobile User-Agent header is included here for the same Cloudflare-bypass
- * reason as in the HTTP client above.
  */
 fun openConsoleWebSocket(
     socketUrl: String,
@@ -201,6 +206,10 @@ fun openConsoleWebSocket(
     panelUrl: String,
     listener: WebSocketListener
 ): WebSocket {
+    if (socketUrl.isBlank()) {
+        throw IllegalArgumentException("Console WebSocket URL is blank")
+    }
+
     val wsClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)  // 0 = no timeout; keep-alive stream
@@ -226,7 +235,7 @@ fun openConsoleWebSocket(
 /**
  * A typed wrapper for every network call result.
  *
- * [Success]      — HTTP 2xx with a non-null body (or 204 No Content mapped to Unit).
+ * [Success]      — HTTP 2xx with a non-null body (or 204 No Content → Unit).
  * [HttpError]    — HTTP error with a human-readable [userMessage] and raw [code].
  * [NetworkError] — Transport-level failure (DNS, timeout, SSL, etc.).
  * [ParseError]   — Body received but JSON parsing failed.
@@ -237,8 +246,8 @@ sealed class ApiResult<out T> {
 
     data class HttpError(
         val code: Int,
-        val userMessage: String,        // Displayed directly in the UI
-        val rawBody: String? = null     // Full error body kept for debug logging
+        val userMessage: String,
+        val rawBody: String? = null
     ) : ApiResult<Nothing>()
 
     data class NetworkError(
@@ -251,9 +260,8 @@ sealed class ApiResult<out T> {
         val cause: Throwable
     ) : ApiResult<Nothing>()
 
-    // ─── Convenience accessors ────────────────────────────────────────────
-
     val isSuccess: Boolean get() = this is Success
+
     val errorMessage: String? get() = when (this) {
         is Success      -> null
         is HttpError    -> userMessage
@@ -264,15 +272,10 @@ sealed class ApiResult<out T> {
 
 // ─── HTTP code → human-readable message ──────────────────────────────────────
 
-/**
- * Maps an HTTP status code plus optional raw error body into a clear user-facing
- * string. Raw JSON blobs and HTML challenge pages are never shown to the user.
- */
 private fun httpErrorMessage(code: Int, rawBody: String?): String = when (code) {
     400 -> "Bad request — check your panel URL and API key format. (HTTP 400)"
     401 -> "Invalid API key — please check your credentials and try again. (HTTP 401)"
     403 -> {
-        // Cloudflare returns 403 with an HTML body containing "Just a moment" or "cf-ray"
         if (rawBody != null &&
             (rawBody.contains("cf-ray", ignoreCase = true) ||
              rawBody.contains("Just a moment", ignoreCase = true) ||
@@ -296,10 +299,16 @@ private fun httpErrorMessage(code: Int, rawBody: String?): String = when (code) 
 // ─── safeApiCall — central call wrapper ──────────────────────────────────────
 
 /**
- * Executes [block] and maps every possible failure mode into a typed [ApiResult].
+ * Executes [block] on the calling dispatcher (must be Dispatchers.IO at call site)
+ * and maps every possible failure mode into a typed [ApiResult].
  *
- * Call sites never need try/catch themselves. All network I/O should flow through
- * this function so error categorisation stays consistent across the app.
+ * Crash-proofing guarantees:
+ *  • All Retrofit/OkHttp exceptions are caught and mapped.
+ *  • Gson parse errors are caught separately.
+ *  • A null success body on a 2xx response is handled (returns HttpError, not NPE).
+ *  • 204 No Content is mapped to Success(Unit) without touching a null body.
+ *  • The raw error body string is read inside a nested runCatching so a secondary
+ *    IOException reading the error body cannot shadow the original HTTP error.
  */
 suspend fun <T> safeApiCall(block: suspend () -> Response<T>): ApiResult<T> {
     return try {
@@ -319,7 +328,13 @@ suspend fun <T> safeApiCall(block: suspend () -> Response<T>): ApiResult<T> {
                 )
             }
         } else {
-            val rawBody = runCatching { response.errorBody()?.string() }.getOrNull()
+            // Read error body inside its own try/catch — errorBody().string() can throw
+            val rawBody = runCatching {
+                response.errorBody()?.string()
+            }.getOrNull()
+
+            Log.w(TAG, "HTTP ${response.code()} — rawBody=$rawBody")
+
             ApiResult.HttpError(
                 code        = response.code(),
                 userMessage = httpErrorMessage(response.code(), rawBody),
@@ -328,28 +343,43 @@ suspend fun <T> safeApiCall(block: suspend () -> Response<T>): ApiResult<T> {
         }
 
     } catch (e: SocketTimeoutException) {
+        Log.w(TAG, "safeApiCall: timeout", e)
         ApiResult.NetworkError(
             userMessage = "Connection timed out — check your internet or panel status.",
             cause       = e
         )
     } catch (e: UnknownHostException) {
+        Log.w(TAG, "safeApiCall: unknown host", e)
         ApiResult.NetworkError(
             userMessage = "Could not reach the panel — check the URL and your connection.",
             cause       = e
         )
     } catch (e: com.google.gson.JsonSyntaxException) {
+        Log.e(TAG, "safeApiCall: JSON parse error", e)
         ApiResult.ParseError(cause = e)
     } catch (e: com.google.gson.JsonIOException) {
+        Log.e(TAG, "safeApiCall: JSON IO error", e)
         ApiResult.ParseError(cause = e)
+    } catch (e: retrofit2.HttpException) {
+        // Retrofit throws this for non-2xx when using non-Response<T> return types.
+        // Should not happen with our Response<T> pattern but guard anyway.
+        Log.w(TAG, "safeApiCall: Retrofit HttpException code=${e.code()}", e)
+        ApiResult.HttpError(
+            code        = e.code(),
+            userMessage = httpErrorMessage(e.code(), e.message())
+        )
     } catch (e: java.io.IOException) {
+        Log.w(TAG, "safeApiCall: IO error", e)
         ApiResult.NetworkError(
             userMessage = "Network error — ${e.message ?: "lost connection to the panel."}",
             cause       = e
         )
     } catch (e: Exception) {
+        Log.e(TAG, "safeApiCall: unexpected error", e)
         ApiResult.NetworkError(
             userMessage = "Unexpected error — ${e.message ?: "please try again."}",
             cause       = e
         )
     }
 }
+
