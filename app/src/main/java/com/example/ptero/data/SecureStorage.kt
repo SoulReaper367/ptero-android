@@ -9,19 +9,22 @@ import com.google.gson.reflect.TypeToken
 import java.util.UUID
 
 /**
- * SecureStorage wraps EncryptedSharedPreferences to persist PanelAccount data
+ * SecureStorage wraps EncryptedSharedPreferences to persist [PanelAccount] data
  * (including API keys) safely on-device using AES-256-GCM.
  *
  * All reads and writes are synchronous — call from a coroutine dispatcher
- * (Dispatchers.IO) to avoid blocking the main thread.
+ * (Dispatchers.IO) when invoked on non-trivial data sizes to avoid jank.
+ *
+ * The [serverId] field added to [PanelAccount] is backward-compatible: existing
+ * persisted JSON that lacks "server_id" deserialises with serverId = null.
  */
 class SecureStorage(context: Context) {
 
     companion object {
-        private const val PREFS_FILE = "ptero_secure_prefs"
-        private const val KEY_ACCOUNTS = "panel_accounts"
-        private const val KEY_DISPLAY_NAME = "display_name"
-        private const val MAX_ACCOUNTS = 4
+        private const val PREFS_FILE        = "ptero_secure_prefs"
+        private const val KEY_ACCOUNTS      = "panel_accounts"
+        private const val KEY_DISPLAY_NAME  = "display_name"
+        private const val MAX_ACCOUNTS      = 4
     }
 
     private val gson = Gson()
@@ -74,15 +77,26 @@ class SecureStorage(context: Context) {
         persistAccounts(updated)
     }
 
+    /**
+     * Builds a new [PanelAccount] with a fresh UUID.
+     *
+     * @param label      Human-readable panel name shown in the UI.
+     * @param panelUrl   Full panel URL; trailing slashes are stripped here.
+     * @param apiKey     Pterodactyl client API key (ptlc_…).
+     * @param serverId   Optional 8-char server short ID. When non-null and non-blank
+     *                   the account will only ever load that specific server.
+     */
     fun createAccount(
         label: String,
         panelUrl: String,
-        apiKey: String
+        apiKey: String,
+        serverId: String? = null
     ): PanelAccount = PanelAccount(
-        id = UUID.randomUUID().toString(),
-        label = label,
-        panelUrl = panelUrl.trimEnd('/'),
-        apiKey = apiKey.trim()
+        id       = UUID.randomUUID().toString(),
+        label    = label.trim(),
+        panelUrl = panelUrl.trim().trimEnd('/'),
+        apiKey   = apiKey.trim(),
+        serverId = serverId?.trim()?.takeIf { it.isNotBlank() }
     )
 
     private fun persistAccounts(accounts: List<PanelAccount>) {
@@ -106,3 +120,4 @@ class SecureStorage(context: Context) {
         prefs.edit().clear().apply()
     }
 }
+
