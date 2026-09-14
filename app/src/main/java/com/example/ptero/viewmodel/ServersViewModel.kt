@@ -67,10 +67,16 @@ class ServersViewModel(application: Application) : AndroidViewModel(application)
         apiKey: String,
         serverId: String? = null
     ): Result<Unit> {
-        val account = secureStorage.createAccount(label, panelUrl, apiKey, serverId)
-        val result  = secureStorage.saveAccount(account)
-        if (result.isSuccess) loadAccounts()
-        return result
+        return try {
+            val account = secureStorage.createAccount(label, panelUrl, apiKey, serverId)
+            val result = secureStorage.saveAccount(account)
+            if (result.isSuccess) {
+                loadAccounts()
+            }
+            result
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
     }
 
     fun removeAccount(id: String) {
@@ -165,7 +171,7 @@ class ServersViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    // ─── Resource polling ─────────────────────────────────────────────────────
+    // ─── Resource polling ────────────────────────────────────────────────     
 
     private fun startResourcePolling() {
         resourcePollJob?.cancel()
@@ -268,3 +274,4 @@ private fun ServerAttributes.applyAccountMeta(account: PanelAccount): ServerAttr
         ?: ""
     return this
 }
+
