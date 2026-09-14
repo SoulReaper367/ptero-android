@@ -115,13 +115,23 @@ object PterodactylApiFactory {
                     .addHeader("Authorization", "Bearer $apiKey")
                     .addHeader("Accept", "application/json")
                     .addHeader("Content-Type", "application/json")
+                    // Prevents Cloudflare / WAF from returning 403 "Just a moment..." challenge pages
+                    .addHeader(
+                        "User-Agent",
+                        "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+                    )
                     .build()
                 chain.proceed(request)
             }
             .addInterceptor(logging)
             .build()
 
-        val baseUrl = panelUrl.trimEnd('/') + "/api/client/"
+        // Safely normalize panel URL even if user includes /api/client/ or trailing slashes
+        val cleanBase = panelUrl.trimEnd('/')
+            .removeSuffix("/api/client")
+            .removeSuffix("/api/client/")
+
+        val baseUrl = "$cleanBase/api/client/"
 
         return Retrofit.Builder()
             .baseUrl(baseUrl)
@@ -137,12 +147,6 @@ object PterodactylApiFactory {
 /**
  * Opens a Pterodactyl console WebSocket and returns the [WebSocket] instance.
  * The panel uses a token-based auth handshake immediately after connection.
- *
- * Event format (JSON):
- *   Inbound  → { "event": "console output", "args": ["line text"] }
- *   Outbound → { "event": "auth", "args": ["<token>"] }
- *              { "event": "send command", "args": ["<cmd>"] }
- *              { "event": "send stats", "args": [""] }
  */
 fun openConsoleWebSocket(
     socketUrl: String,
@@ -159,6 +163,10 @@ fun openConsoleWebSocket(
     val request = Request.Builder()
         .url(socketUrl)
         .addHeader("Origin", panelUrl)
+        .addHeader(
+            "User-Agent",
+            "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+        )
         .build()
 
     return client.newWebSocket(request, listener)
@@ -195,3 +203,4 @@ suspend fun <T> safeApiCall(block: suspend () -> Response<T>): ApiResult<T> {
         ApiResult.NetworkError(e)
     }
 }
+
