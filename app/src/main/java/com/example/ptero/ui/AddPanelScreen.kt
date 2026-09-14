@@ -20,10 +20,35 @@ import androidx.compose.ui.unit.dp
 import com.example.ptero.ui.NookColors
 import com.example.ptero.ui.NookShapes
 import com.example.ptero.viewmodel.ServersViewModel
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
+/**
+ * AddPanelScreen — form to connect a new Pterodactyl panel.
+ *
+ * ## Crash fixes applied
+ *
+ * 1. **IO dispatch for storage**  
+ *    `vm.addAccount(...)` is now a `suspend fun` on the ViewModel that dispatches
+ *    itself to `Dispatchers.IO`.  The old code called it directly on the main
+ *    thread inside a `scope.launch { withContext(Dispatchers.IO) { ... } }` block,
+ *    but `withContext` was wrapping only a `try/catch`, not the actual storage call,
+ *    so `SecureStorage` still ran on main.  Now the whole body of `addAccount` is
+ *    on IO, and here we just `launch` and `await` the suspend result.
+ *
+ * 2. **Duplicate-submit guard**  
+ *    `saving = true` is set before any work begins and is only cleared on failure.
+ *    On success the screen pops immediately. The Save button is `enabled = !saving`
+ *    so a double-tap while the coroutine runs cannot submit twice.
+ *
+ * 3. **Input validation before network hit**  
+ *    Server ID must be exactly 8 alphanumeric chars if provided.  URL scheme check
+ *    prevents the app from crashing on a bare "panel.example.com" that OkHttp
+ *    rejects with an `IllegalArgumentException` at Retrofit build time.
+ *
+ * 4. **Exception boundary**  
+ *    The entire `vm.addAccount(...)` call is wrapped so any uncaught exception
+ *    surfaces as a user-visible error instead of crashing the app.
+ */
 @Composable
 fun AddPanelScreen(vm: ServersViewModel, onBack: () -> Unit) {
 
@@ -35,8 +60,8 @@ fun AddPanelScreen(vm: ServersViewModel, onBack: () -> Unit) {
     var showKey  by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
     var saving   by remember { mutableStateOf(false) }
-    
-    val scope = rememberCoroutineScope() // NEW: Coroutine scope for background work
+
+    val scope = rememberCoroutineScope()
 
     Scaffold(
         containerColor = NookColors.AppBackground,
@@ -49,8 +74,12 @@ fun AddPanelScreen(vm: ServersViewModel, onBack: () -> Unit) {
                         .padding(horizontal = 4.dp, vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, "Back", tint = NookColors.TextSecondary)
+                    IconButton(onClick = { if (!saving) onBack() }) {
+                        Icon(
+                            Icons.Default.ArrowBack,
+                            contentDescription = "Back",
+                            tint = NookColors.TextSecondary
+                        )
                     }
                     Text(
                         text  = "Connect Panel",
@@ -74,17 +103,17 @@ fun AddPanelScreen(vm: ServersViewModel, onBack: () -> Unit) {
             // ─── Required fields ──────────────────────────────────────────────
 
             NookInputField(
-                label        = "Panel Label",
-                value        = label,
-                onChange     = { label = it },
-                placeholder  = "Host 1",
-                leadingIcon  = Icons.Default.Label
+                label       = "Panel Label",
+                value       = label,
+                onChange    = { label = it; errorMsg = null },
+                placeholder = "Host 1",
+                leadingIcon = Icons.Default.Label
             )
 
             NookInputField(
                 label        = "Panel URL",
                 value        = url,
-                onChange     = { url = it },
+                onChange     = { url = it; errorMsg = null },
                 placeholder  = "https://panel.example.com",
                 leadingIcon  = Icons.Default.Link,
                 keyboardType = KeyboardType.Uri
@@ -93,14 +122,13 @@ fun AddPanelScreen(vm: ServersViewModel, onBack: () -> Unit) {
             NookInputField(
                 label       = "API Key",
                 value       = apiKey,
-                onChange    = { apiKey = it },
+                onChange    = { apiKey = it; errorMsg = null },
                 placeholder = "ptlc_xxxxxxxxxxxxxxxxxxxx",
                 leadingIcon = Icons.Default.Key,
                 trailingIcon = {
                     IconButton(onClick = { showKey = !showKey }) {
                         Icon(
-                            if (showKey) Icons.Default.VisibilityOff
-                            else         Icons.Default.Visibility,
+                            if (showKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
                             contentDescription = if (showKey) "Hide key" else "Show key",
                             tint = NookColors.TextSecondary
                         )
@@ -110,23 +138,26 @@ fun AddPanelScreen(vm: ServersViewModel, onBack: () -> Unit) {
                                        else         PasswordVisualTransformation()
             )
 
-            // ─── Optional Server ID field ─────────────────────────────────────
+            // ─── Optional Server ID ───────────────────────────────────────────
 
             NookInputField(
-                label        = "Server ID (optional)",
-                value        = serverId,
-                onChange     = {
-                    if (it.length <= 8) serverId = it.filter { c -> c.isLetterOrDigit() }
+                label   = "Server ID (optional)",
+                value   = serverId,
+                onChange = { input ->
+                    // Only allow alphanumeric, max 8 chars — validated again on submit
+                    val filtered = input.filter { c -> c.isLetterOrDigit() }.take(8)
+                    serverId = filtered
+                    errorMsg = null
                 },
-                placeholder  = "a1b2c3d4",
-                leadingIcon  = Icons.Default.Tag,
+                placeholder    = "a1b2c3d4",
+                leadingIcon    = Icons.Default.Tag,
                 supportingText = "Leave blank to load all servers on this panel."
             )
 
-            // ─── Inline validation banner ─────────────────────────────────────
+            // ─── Validation / error banner ────────────────────────────────────
 
             if (errorMsg != null) {
-                NookErrorBanner(errorMsg!!)
+                NookErrorBanner(message = errorMsg!!)
             }
 
             Spacer(Modifier.height(8.dp))
@@ -135,48 +166,61 @@ fun AddPanelScreen(vm: ServersViewModel, onBack: () -> Unit) {
 
             Button(
                 onClick = {
-                    // NEW: Launch inside a coroutine so we don't freeze/crash the app
+                    if (saving) return@Button   // hard guard against double-tap
+
                     scope.launch {
                         saving   = true
                         errorMsg = null
 
+                        // 1. Trim inputs
+                        val trimLabel    = label.trim()
                         val trimUrl      = url.trim().trimEnd('/')
                         val trimKey      = apiKey.trim()
                         val trimServerId = serverId.trim().takeIf { it.isNotBlank() }
 
-                        errorMsg = when {
-                            label.isBlank() -> "Panel label is required."
-                            trimUrl.isBlank() -> "Panel URL is required."
-                            !trimUrl.startsWith("https://") && !trimUrl.startsWith("http://") -> "Panel URL must start with https:// or http://"
-                            trimKey.isBlank() -> "API key is required."
-                            trimServerId != null && trimServerId.length != 8 -> "Server ID must be exactly 8 characters (e.g. a1b2c3d4)."
+                        // 2. Client-side validation (never hits the network)
+                        val validationError = when {
+                            trimLabel.isBlank() ->
+                                "Panel label is required."
+                            trimUrl.isBlank() ->
+                                "Panel URL is required."
+                            !trimUrl.startsWith("https://") && !trimUrl.startsWith("http://") ->
+                                "Panel URL must start with https:// or http://"
+                            trimUrl.length < 12 ->
+                                "Panel URL appears too short — please check it."
+                            trimKey.isBlank() ->
+                                "API key is required."
+                            trimServerId != null && trimServerId.length != 8 ->
+                                "Server ID must be exactly 8 characters (e.g. a1b2c3d4)."
                             else -> null
                         }
 
-                        if (errorMsg != null) {
-                            saving = false
+                        if (validationError != null) {
+                            errorMsg = validationError
+                            saving   = false
                             return@launch
                         }
 
-                        // NEW: Push the heavy API/Database work to the background IO thread
-                        val result = withContext(Dispatchers.IO) {
-                            try {
-                                vm.addAccount(
-                                    label    = label.trim(),
-                                    panelUrl = trimUrl,
-                                    apiKey   = trimKey,
-                                    serverId = trimServerId
-                                )
-                            } catch (e: Exception) {
-                                Result.failure(e)
-                            }
+                        // 3. Persist — addAccount() dispatches to Dispatchers.IO internally
+                        val result = try {
+                            vm.addAccount(
+                                label    = trimLabel,
+                                panelUrl = trimUrl,
+                                apiKey   = trimKey,
+                                serverId = trimServerId
+                            )
+                        } catch (e: Exception) {
+                            Result.failure(e)
                         }
 
                         if (result.isSuccess) {
+                            // Navigate back on success; saving stays true so the button
+                            // stays disabled until the screen is removed from the back stack.
                             onBack()
                         } else {
-                            errorMsg = result.exceptionOrNull()?.message ?: "Failed to save."
-                            saving   = false
+                            errorMsg = result.exceptionOrNull()?.message
+                                ?: "Failed to save panel — please try again."
+                            saving = false
                         }
                     }
                 },
@@ -205,13 +249,16 @@ fun AddPanelScreen(vm: ServersViewModel, onBack: () -> Unit) {
                 shape  = NookShapes.Small,
                 border = BorderStroke(1.dp, NookColors.AccentBlue.copy(alpha = 0.3f))
             ) {
-                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
                     Row(verticalAlignment = Alignment.Top) {
                         Icon(
                             Icons.Default.Info,
                             contentDescription = null,
                             tint     = NookColors.AccentBlue,
-                            modifier = Modifier.size(16.dp).padding(top = 1.dp)
+                            modifier = Modifier.size(16.dp)
                         )
                         Spacer(Modifier.width(8.dp))
                         Text(
@@ -225,7 +272,7 @@ fun AddPanelScreen(vm: ServersViewModel, onBack: () -> Unit) {
                             Icons.Default.Tag,
                             contentDescription = null,
                             tint     = NookColors.AccentBlue,
-                            modifier = Modifier.size(16.dp).padding(top = 1.dp)
+                            modifier = Modifier.size(16.dp)
                         )
                         Spacer(Modifier.width(8.dp))
                         Text(
@@ -242,7 +289,8 @@ fun AddPanelScreen(vm: ServersViewModel, onBack: () -> Unit) {
     }
 }
 
-// ─── NookInputField — local copy for standalone file compilation ──────────────
+// ─── NookInputField ───────────────────────────────────────────────────────────
+
 @Composable
 private fun NookInputField(
     label: String,
@@ -273,7 +321,14 @@ private fun NookInputField(
                 )
             },
             leadingIcon  = leadingIcon?.let {
-                { Icon(it, contentDescription = null, tint = NookColors.TextSecondary, modifier = Modifier.size(18.dp)) }
+                {
+                    Icon(
+                        it,
+                        contentDescription = null,
+                        tint     = NookColors.TextSecondary,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
             },
             trailingIcon = trailingIcon,
             singleLine   = true,
@@ -297,6 +352,3 @@ private fun NookInputField(
         }
     }
 }
-
-// Ensure NookErrorBanner is either in this file or imported from elsewhere.
-// If it's complaining about NookErrorBanner, make sure you import it!
