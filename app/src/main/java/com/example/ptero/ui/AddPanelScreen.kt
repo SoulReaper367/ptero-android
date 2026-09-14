@@ -1,19 +1,5 @@
 package com.example.ptero
 
-// ─────────────────────────────────────────────────────────────────────────────
-// AddPanelScreen.kt
-//
-// Drop-in replacement for the AddPanelScreen composable that was previously
-// inlined in MainActivity.kt.  Extract it to its own file to keep MainActivity
-// focused on navigation wiring.
-//
-// Changes vs. original:
-//   • Added optional "Server ID" field (8-char short identifier).
-//   • Passes serverId through to ServersViewModel.addAccount().
-//   • Inline validation with clear user messages (no raw API errors).
-//   • Info card updated to explain the Server ID field.
-// ─────────────────────────────────────────────────────────────────────────────
-
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -34,6 +20,9 @@ import androidx.compose.ui.unit.dp
 import com.example.ptero.ui.NookColors
 import com.example.ptero.ui.NookShapes
 import com.example.ptero.viewmodel.ServersViewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 fun AddPanelScreen(vm: ServersViewModel, onBack: () -> Unit) {
@@ -42,10 +31,12 @@ fun AddPanelScreen(vm: ServersViewModel, onBack: () -> Unit) {
     var label    by remember { mutableStateOf("") }
     var url      by remember { mutableStateOf("") }
     var apiKey   by remember { mutableStateOf("") }
-    var serverId by remember { mutableStateOf("") }   // NEW — optional 8-char ID
+    var serverId by remember { mutableStateOf("") }
     var showKey  by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
     var saving   by remember { mutableStateOf(false) }
+    
+    val scope = rememberCoroutineScope() // NEW: Coroutine scope for background work
 
     Scaffold(
         containerColor = NookColors.AppBackground,
@@ -125,7 +116,6 @@ fun AddPanelScreen(vm: ServersViewModel, onBack: () -> Unit) {
                 label        = "Server ID (optional)",
                 value        = serverId,
                 onChange     = {
-                    // Enforce 8-char alphanumeric to match Pterodactyl short IDs
                     if (it.length <= 8) serverId = it.filter { c -> c.isLetterOrDigit() }
                 },
                 placeholder  = "a1b2c3d4",
@@ -145,45 +135,49 @@ fun AddPanelScreen(vm: ServersViewModel, onBack: () -> Unit) {
 
             Button(
                 onClick = {
-                    saving   = true
-                    errorMsg = null
+                    // NEW: Launch inside a coroutine so we don't freeze/crash the app
+                    scope.launch {
+                        saving   = true
+                        errorMsg = null
 
-                    val trimUrl      = url.trim().trimEnd('/')
-                    val trimKey      = apiKey.trim()
-                    val trimServerId = serverId.trim().takeIf { it.isNotBlank() }
+                        val trimUrl      = url.trim().trimEnd('/')
+                        val trimKey      = apiKey.trim()
+                        val trimServerId = serverId.trim().takeIf { it.isNotBlank() }
 
-                    // Client-side validation — descriptive, never raw API JSON
-                    errorMsg = when {
-                        label.isBlank() ->
-                            "Panel label is required."
-                        trimUrl.isBlank() ->
-                            "Panel URL is required."
-                        !trimUrl.startsWith("https://") && !trimUrl.startsWith("http://") ->
-                            "Panel URL must start with https:// or http://"
-                        trimKey.isBlank() ->
-                            "API key is required."
-                        trimServerId != null && trimServerId.length != 8 ->
-                            "Server ID must be exactly 8 characters (e.g. a1b2c3d4)."
-                        else -> null
-                    }
+                        errorMsg = when {
+                            label.isBlank() -> "Panel label is required."
+                            trimUrl.isBlank() -> "Panel URL is required."
+                            !trimUrl.startsWith("https://") && !trimUrl.startsWith("http://") -> "Panel URL must start with https:// or http://"
+                            trimKey.isBlank() -> "API key is required."
+                            trimServerId != null && trimServerId.length != 8 -> "Server ID must be exactly 8 characters (e.g. a1b2c3d4)."
+                            else -> null
+                        }
 
-                    if (errorMsg != null) {
-                        saving = false
-                        return@Button
-                    }
+                        if (errorMsg != null) {
+                            saving = false
+                            return@launch
+                        }
 
-                    val result = vm.addAccount(
-                        label    = label.trim(),
-                        panelUrl = trimUrl,
-                        apiKey   = trimKey,
-                        serverId = trimServerId
-                    )
+                        // NEW: Push the heavy API/Database work to the background IO thread
+                        val result = withContext(Dispatchers.IO) {
+                            try {
+                                vm.addAccount(
+                                    label    = label.trim(),
+                                    panelUrl = trimUrl,
+                                    apiKey   = trimKey,
+                                    serverId = trimServerId
+                                )
+                            } catch (e: Exception) {
+                                Result.failure(e)
+                            }
+                        }
 
-                    if (result.isSuccess) {
-                        onBack()
-                    } else {
-                        errorMsg = result.exceptionOrNull()?.message ?: "Failed to save."
-                        saving   = false
+                        if (result.isSuccess) {
+                            onBack()
+                        } else {
+                            errorMsg = result.exceptionOrNull()?.message ?: "Failed to save."
+                            saving   = false
+                        }
                     }
                 },
                 modifier = Modifier
@@ -249,11 +243,6 @@ fun AddPanelScreen(vm: ServersViewModel, onBack: () -> Unit) {
 }
 
 // ─── NookInputField — local copy for standalone file compilation ──────────────
-//
-// In the real project this composable lives in MainActivity.kt (or a shared
-// Composables.kt).  It is reproduced here only so this file compiles in
-// isolation.  Remove / deduplicate if you extract it to a shared file.
-//
 @Composable
 private fun NookInputField(
     label: String,
@@ -308,3 +297,6 @@ private fun NookInputField(
         }
     }
 }
+
+// Ensure NookErrorBanner is either in this file or imported from elsewhere.
+// If it's complaining about NookErrorBanner, make sure you import it!
