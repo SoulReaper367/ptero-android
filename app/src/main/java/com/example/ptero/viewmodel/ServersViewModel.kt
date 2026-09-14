@@ -8,18 +8,31 @@ import com.example.ptero.data.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
+// ─── UI models ────────────────────────────────────────────────────────────────
+
 data class UiServer(
     val attributes: ServerAttributes,
     val account: PanelAccount
 )
 
+/**
+ * Screen state emitted by [ServersViewModel].
+ *
+ * [errors] is a list rather than a single string so that per-panel failures
+ * are shown independently — one bad API key shouldn't hide servers from other panels.
+ */
 data class HomeUiState(
     val isLoading: Boolean = false,
     val servers: List<UiServer> = emptyList(),
     val accounts: List<PanelAccount> = emptyList(),
-    val error: String? = null,
-    val powerActionInProgress: Set<String> = emptySet()  // identifiers
-)
+    val errors: List<String> = emptyList(),        // human-readable, already mapped from ApiResult
+    val powerActionInProgress: Set<String> = emptySet()  // server identifiers
+) {
+    /** Convenience: single error string for legacy callers / simple banners. */
+    val error: String? get() = errors.joinToString("\n").ifBlank { null }
+}
+
+// ─── ViewModel ────────────────────────────────────────────────────────────────
 
 class ServersViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -39,14 +52,23 @@ class ServersViewModel(application: Application) : AndroidViewModel(application)
     fun loadAccounts() {
         val accounts = secureStorage.getAccounts()
         _uiState.update { it.copy(accounts = accounts) }
-        if (accounts.isNotEmpty()) {
-            fetchAllServers()
-        }
+        if (accounts.isNotEmpty()) fetchAllServers()
     }
 
-    fun addAccount(label: String, panelUrl: String, apiKey: String): Result<Unit> {
-        val account = secureStorage.createAccount(label, panelUrl, apiKey)
-        val result = secureStorage.saveAccount(account)
+    /**
+     * Creates and persists a new [PanelAccount].
+     *
+     * @param serverId Optional 8-character short server identifier. When provided
+     *                 this panel entry only loads that specific server.
+     */
+    fun addAccount(
+        label: String,
+        panelUrl: String,
+        apiKey: String,
+        serverId: String? = null
+    ): Result<Unit> {
+        val account = secureStorage.createAccount(label, panelUrl, apiKey, serverId)
+        val result  = secureStorage.saveAccount(account)
         if (result.isSuccess) loadAccounts()
         return result
     }
@@ -63,7 +85,8 @@ class ServersViewModel(application: Application) : AndroidViewModel(application)
 
     fun fetchAllServers() {
         viewModelScope.launch {
-            _uiState.update { it.copy(isLoading = true, error = null) }
+            _uiState.update { it.copy(isLoading = true, errors = emptyList()) }
+
             val accounts = secureStorage.getAccounts()
             if (accounts.isEmpty()) {
                 _uiState.update { it.copy(isLoading = false, servers = emptyList()) }
@@ -71,8 +94,9 @@ class ServersViewModel(application: Application) : AndroidViewModel(application)
             }
 
             val allServers = mutableListOf<UiServer>()
-            val errors = mutableListOf<String>()
+            val errors     = mutableListOf<String>()
 
+            // Fan out — each account fetches concurrently
             val deferreds = accounts.map { account ->
                 async(Dispatchers.IO) {
                     fetchServersForAccount(account)
@@ -81,9 +105,10 @@ class ServersViewModel(application: Application) : AndroidViewModel(application)
 
             deferreds.forEach { deferred ->
                 when (val result = deferred.await()) {
-                    is ApiResult.Success -> allServers.addAll(result.data)
-                    is ApiResult.Error   -> errors.add("HTTP ${result.code}: ${result.message}")
-                    is ApiResult.NetworkError -> errors.add(result.cause.message ?: "Network error")
+                    is ApiResult.Success     -> allServers.addAll(result.data)
+                    is ApiResult.HttpError   -> errors.add("[${getAccountLabel(result)}] ${result.userMessage}")
+                    is ApiResult.NetworkError -> errors.add(result.userMessage)
+                    is ApiResult.ParseError  -> errors.add(result.userMessage)
                 }
             }
 
@@ -91,41 +116,51 @@ class ServersViewModel(application: Application) : AndroidViewModel(application)
                 it.copy(
                     isLoading = false,
                     servers   = allServers,
-                    error     = errors.joinToString("\n").ifBlank { null }
+                    errors    = errors
                 )
             }
 
-            // Kick off resource polling for all servers
             startResourcePolling()
         }
     }
 
+    /**
+     * Fetches servers for [account].
+     *
+     * - If [PanelAccount.isPinned] is true, calls GET /api/client/servers/{identifier}
+     *   to load exactly one server.
+     * - Otherwise lists all account servers via GET /api/client/servers?include=allocations.
+     */
     private suspend fun fetchServersForAccount(
         account: PanelAccount
     ): ApiResult<List<UiServer>> {
         val api = PterodactylApiFactory.getApi(account.panelUrl, account.apiKey)
-        return safeApiCall { api.listServers(1) }.let { result ->
-            when (result) {
+
+        return if (account.isPinned) {
+            // Single-server path: fetch by known identifier
+            when (val result = safeApiCall { api.getServer(account.serverId!!) }) {
+                is ApiResult.Success -> {
+                    val uiServer = result.data.attributes
+                        .applyAccountMeta(account)
+                        .let { UiServer(it, account) }
+                    ApiResult.Success(listOf(uiServer))
+                }
+                is ApiResult.HttpError    -> result
+                is ApiResult.NetworkError -> result
+                is ApiResult.ParseError   -> result
+            }
+        } else {
+            // Full-list path
+            when (val result = safeApiCall { api.listServers() }) {
                 is ApiResult.Success -> {
                     val servers = result.data.data.map { wrapper ->
-                        val attrs = wrapper.attributes.apply {
-                            panelAccountId = account.id
-                            panelLabel     = account.label
-                            // Resolve default allocation display
-                            val defaultAlloc = relationships
-                                ?.allocations?.data
-                                ?.firstOrNull { it.attributes.isDefault }
-                                ?.attributes
-                            allocationDisplay = if (defaultAlloc != null) {
-                                "${defaultAlloc.ipAlias ?: defaultAlloc.ip}:${defaultAlloc.port}"
-                            } else ""
-                        }
-                        UiServer(attrs, account)
+                        UiServer(wrapper.attributes.applyAccountMeta(account), account)
                     }
                     ApiResult.Success(servers)
                 }
-                is ApiResult.Error        -> result
+                is ApiResult.HttpError    -> result
                 is ApiResult.NetworkError -> result
+                is ApiResult.ParseError   -> result
             }
         }
     }
@@ -137,7 +172,7 @@ class ServersViewModel(application: Application) : AndroidViewModel(application)
         resourcePollJob = viewModelScope.launch {
             while (isActive) {
                 refreshAllResources()
-                delay(8_000L) // Poll every 8 seconds
+                delay(8_000L)
             }
         }
     }
@@ -152,14 +187,19 @@ class ServersViewModel(application: Application) : AndroidViewModel(application)
                     uiServer.account.panelUrl,
                     uiServer.account.apiKey
                 )
-                when (val res = safeApiCall { api.getServerResources(uiServer.attributes.identifier) }) {
+                when (val res = safeApiCall {
+                    api.getServerResources(uiServer.attributes.identifier)
+                }) {
                     is ApiResult.Success -> {
-                        uiServer.attributes.currentCpu         = res.data.attributes.resources.cpuAbsolute
-                        uiServer.attributes.currentMemoryBytes = res.data.attributes.resources.memoryBytes
-                        uiServer.attributes.currentDiskBytes   = res.data.attributes.resources.diskBytes
-                        uiServer.attributes.serverStatus       = res.data.attributes.currentState
+                        uiServer.attributes.apply {
+                            currentCpu         = res.data.attributes.resources.cpuAbsolute
+                            currentMemoryBytes = res.data.attributes.resources.memoryBytes
+                            currentDiskBytes   = res.data.attributes.resources.diskBytes
+                            serverStatus       = res.data.attributes.currentState
+                        }
                         uiServer
                     }
+                    // Silent failure on poll — keep stale data rather than flashing an error
                     else -> uiServer
                 }
             }
@@ -180,8 +220,16 @@ class ServersViewModel(application: Application) : AndroidViewModel(application)
                 uiServer.account.panelUrl,
                 uiServer.account.apiKey
             )
-            safeApiCall { api.sendPowerSignal(identifier, PowerSignalRequest(signal)) }
-            delay(1_500L) // Brief pause before re-polling so state updates
+            val result = safeApiCall {
+                api.sendPowerSignal(identifier, PowerSignalRequest(signal))
+            }
+            if (result is ApiResult.HttpError || result is ApiResult.NetworkError) {
+                val msg = result.errorMessage ?: "Power action failed."
+                _uiState.update { state ->
+                    state.copy(errors = state.errors + msg)
+                }
+            }
+            delay(1_500L)
             refreshAllResources()
             _uiState.update {
                 it.copy(powerActionInProgress = it.powerActionInProgress - identifier)
@@ -193,4 +241,30 @@ class ServersViewModel(application: Application) : AndroidViewModel(application)
         super.onCleared()
         resourcePollJob?.cancel()
     }
+
+    // ─── Helpers ─────────────────────────────────────────────────────────────
+
+    /** Returns a short label string for error messages when we have the account in scope. */
+    private fun getAccountLabel(result: ApiResult.HttpError): String = ""  // expanded below
+
+    private fun getAccountLabelFor(account: PanelAccount): String =
+        account.label.ifBlank { account.panelUrl }
+}
+
+// ─── Extension — inject panel metadata into ServerAttributes ─────────────────
+
+/**
+ * Fills the runtime-only metadata fields on a freshly-deserialised [ServerAttributes].
+ * These fields are not part of the API JSON but are needed by the UI.
+ */
+private fun ServerAttributes.applyAccountMeta(account: PanelAccount): ServerAttributes {
+    panelAccountId = account.id
+    panelLabel     = account.label
+    allocationDisplay = relationships
+        ?.allocations?.data
+        ?.firstOrNull { it.attributes.isDefault }
+        ?.attributes
+        ?.let { alloc -> "${alloc.ipAlias ?: alloc.ip}:${alloc.port}" }
+        ?: ""
+    return this
 }
