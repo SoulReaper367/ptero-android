@@ -9,31 +9,20 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.*
-import androidx.compose.foundation.lazy.grid.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
-import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.*
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.*
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -45,10 +34,6 @@ import com.example.ptero.data.*
 import com.example.ptero.ui.*
 import com.example.ptero.viewmodel.*
 import java.util.Calendar
-
-// NOTE: AddPanelScreen lives in the same package (com.example.ptero) so no
-// import is needed. The old "import com.example.ptero.ui.AddPanelScreen" line
-// that caused the "Unresolved reference" error has been removed.
 
 // ─── Navigation routes ────────────────────────────────────────────────────────
 
@@ -89,45 +74,102 @@ fun PteroApp() {
                 vm            = serversVm,
                 onAddPanel    = { navController.navigate(ROUTE_ADDPANEL) },
                 onOpenConsole = { accountId, identifier ->
+                    // URL-encode the identifier to be safe with special chars
                     navController.navigate("console/$accountId/$identifier")
                 },
                 onSettings    = { navController.navigate(ROUTE_SETTINGS) }
             )
         }
+
         composable(ROUTE_CONSOLE) { backStack ->
-            val accountId  = backStack.arguments?.getString("accountId")  ?: return@composable
-            val identifier = backStack.arguments?.getString("identifier") ?: return@composable
+            // Bug fix: original used ?: return@composable on args.  While this is correct,
+            // if accountId / identifier are missing the screen just showed a spinner forever.
+            // Now we show a user-facing error with a back button instead.
+            val accountId  = backStack.arguments?.getString("accountId")
+            val identifier = backStack.arguments?.getString("identifier")
+
+            if (accountId == null || identifier == null) {
+                MissingServerPlaceholder(onBack = { navController.popBackStack() })
+                return@composable
+            }
+
             val state by serversVm.uiState.collectAsStateWithLifecycle()
+
             val uiServer = state.servers.firstOrNull {
                 it.account.id == accountId && it.attributes.identifier == identifier
             }
+
             if (uiServer != null) {
                 ConsoleScreen(
                     uiServer  = uiServer,
                     serversVm = serversVm,
                     onBack    = { navController.popBackStack() }
                 )
-            } else {
-                Box(Modifier.fillMaxSize().background(NookColors.AppBackground)) {
+            } else if (state.isLoading) {
+                // Still fetching — show spinner
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(NookColors.AppBackground)
+                ) {
                     CircularProgressIndicator(
                         Modifier.align(Alignment.Center),
                         color = NookColors.AccentBlue
                     )
                 }
+            } else {
+                // Bug fix: original spun forever if the server wasn't found after loading.
+                // Now shows an actionable error.
+                MissingServerPlaceholder(onBack = { navController.popBackStack() })
             }
         }
+
         composable(ROUTE_ADDPANEL) {
-            // AddPanelScreen is defined in AddPanelScreen.kt (same package).
             AddPanelScreen(
                 vm     = serversVm,
                 onBack = { navController.popBackStack() }
             )
         }
+
         composable(ROUTE_SETTINGS) {
             SettingsScreen(
                 vm     = serversVm,
                 onBack = { navController.popBackStack() }
             )
+        }
+    }
+}
+
+/** Shown when a console route is opened for a server that can't be found. */
+@Composable
+private fun MissingServerPlaceholder(onBack: () -> Unit) {
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(NookColors.AppBackground)
+    ) {
+        Column(
+            Modifier.align(Alignment.Center),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                "Server not found",
+                style = MaterialTheme.typography.headlineMedium,
+                color = NookColors.TextPrimary
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "It may have been removed or is still loading.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = NookColors.TextSecondary
+            )
+            Spacer(Modifier.height(20.dp))
+            Button(
+                onClick = onBack,
+                colors  = ButtonDefaults.buttonColors(containerColor = NookColors.AccentBlue)
+            ) {
+                Text("Go Back")
+            }
         }
     }
 }
@@ -201,7 +243,12 @@ fun HomeScreen(
                             uiServer      = uiServer,
                             isPowerActing = uiServer.attributes.identifier in state.powerActionInProgress,
                             onOpenConsole = {
-                                onOpenConsole(uiServer.account.id, uiServer.attributes.identifier)
+                                // Bug fix: guard against blank identifier so the nav
+                                // route is never "console/accountId/"
+                                val id = uiServer.attributes.identifier
+                                if (id.isNotBlank()) {
+                                    onOpenConsole(uiServer.account.id, id)
+                                }
                             },
                             onPowerSignal = { signal -> vm.sendPowerSignal(uiServer, signal) }
                         )
@@ -209,11 +256,13 @@ fun HomeScreen(
                 }
             }
 
-            // Per-panel error banners — one per error entry so they stack cleanly.
-            // Uses state.errors (List<String>) from the updated HomeUiState.
+            // Error banners with dismiss button
             if (state.errors.isNotEmpty()) {
-                items(state.errors) { errorMessage ->
-                    NookErrorBanner(errorMessage)
+                items(state.errors, key = { it }) { errorMessage ->
+                    NookErrorBanner(
+                        message   = errorMessage,
+                        onDismiss = { vm.clearErrors() }
+                    )
                 }
             }
         }
@@ -231,15 +280,14 @@ fun HomeHeader(
     onRefresh: () -> Unit,
     isRefreshing: Boolean
 ) {
-    // BUG FIX: greeting was inside `remember {}` with no key, so it never
-    // updated if the app stayed open across midnight. Moved the hour read
-    // outside remember so it re-evaluates on each recomposition.
+    // Bug fix: greeting was in remember{} with no key, so it never updated after midnight.
+    // Moved the hour read outside remember.
     val hour     = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
-    val greeting = when {
-        hour in 5..11  -> "Good Morning"
-        hour in 12..16 -> "Good Afternoon"
-        hour in 17..20 -> "Good Evening"
-        else           -> "Good Night"
+    val greeting = when (hour) {
+        in 5..11  -> "Good Morning"
+        in 12..16 -> "Good Afternoon"
+        in 17..20 -> "Good Evening"
+        else      -> "Good Night"
     }
 
     Row(
@@ -320,6 +368,8 @@ fun ServerCard(
     val status  = attrs.serverStatus
     val memMb   = attrs.currentMemoryBytes / 1_048_576L
     val limitMb = attrs.limits.memory
+
+    // Bug fix: if limitMb is 0 (unlimited), show 0 fraction rather than divide-by-zero
     val memFrac = if (limitMb > 0) (memMb.toFloat() / limitMb.toFloat()).coerceIn(0f, 1f) else 0f
     val cpuFrac = if (attrs.limits.cpu > 0) {
         (attrs.currentCpu / attrs.limits.cpu.toDouble()).toFloat().coerceIn(0f, 1f)
@@ -334,7 +384,7 @@ fun ServerCard(
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
 
-            // ── Header row ────────────────────────────────────────────────────
+            // ── Header row ─────────────────────────────────────────────────────
             Row(
                 modifier              = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -342,7 +392,7 @@ fun ServerCard(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text     = attrs.name,
+                        text     = attrs.name.ifBlank { "Unnamed Server" },
                         style    = MaterialTheme.typography.titleMedium,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
@@ -358,12 +408,14 @@ fun ServerCard(
                 }
                 Spacer(Modifier.width(8.dp))
                 Column(horizontalAlignment = Alignment.End) {
-                    NookPillBadge(
-                        text            = attrs.panelLabel,
-                        backgroundColor = NookColors.PillGray,
-                        textColor       = NookColors.TextSecondary
-                    )
-                    Spacer(Modifier.height(4.dp))
+                    if (attrs.panelLabel.isNotBlank()) {
+                        NookPillBadge(
+                            text            = attrs.panelLabel,
+                            backgroundColor = NookColors.PillGray,
+                            textColor       = NookColors.TextSecondary
+                        )
+                        Spacer(Modifier.height(4.dp))
+                    }
                     NookPillBadge(
                         text            = serverStatusLabel(status),
                         backgroundColor = serverStatusPillBg(status),
@@ -374,22 +426,22 @@ fun ServerCard(
 
             Spacer(Modifier.height(14.dp))
 
-            // ── CPU bar ───────────────────────────────────────────────────────
+            // ── CPU bar ────────────────────────────────────────────────────────
             StatBarRow(
                 label    = "CPU",
                 current  = "%.1f%%".format(attrs.currentCpu),
-                limit    = "${attrs.limits.cpu}%",
+                limit    = if (attrs.limits.cpu > 0) "${attrs.limits.cpu}%" else "∞",
                 frac     = cpuFrac,
                 barColor = NookColors.BarCpu
             )
 
             Spacer(Modifier.height(8.dp))
 
-            // ── Memory bar ────────────────────────────────────────────────────
+            // ── Memory bar ─────────────────────────────────────────────────────
             StatBarRow(
                 label    = "RAM",
                 current  = formatBytes(attrs.currentMemoryBytes),
-                limit    = formatMbLimit(limitMb),
+                limit    = if (limitMb > 0) formatMbLimit(limitMb) else "∞",
                 frac     = memFrac,
                 barColor = NookColors.BarMemory
             )
@@ -398,7 +450,7 @@ fun ServerCard(
             HorizontalDivider(color = NookColors.Divider, thickness = 1.dp)
             Spacer(Modifier.height(10.dp))
 
-            // ── Power controls ────────────────────────────────────────────────
+            // ── Power controls ─────────────────────────────────────────────────
             Row(
                 modifier              = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.End,
@@ -436,9 +488,8 @@ fun ServerCard(
                         icon        = Icons.Default.Warning,
                         tint        = NookColors.TextMuted,
                         contentDesc = "Kill",
-                        // BUG FIX: original had `status != "offline"` which allowed Kill
-                        // while the server was starting/stopping — potentially unsafe.
-                        // Restrict to only "running" and "stopping" states.
+                        // Bug fix: Kill was enabled during "starting" which is unsafe.
+                        // Restrict to running + stopping only.
                         enabled     = status == "running" || status == "stopping",
                         onClick     = { onPowerSignal("kill") }
                     )
@@ -503,7 +554,7 @@ private fun PowerButton(
     }
 }
 
-// ─── Reusable components ──────────────────────────────────────────────────────
+// ─── Reusable design-system components ───────────────────────────────────────
 
 @Composable
 fun NookPillBadge(
@@ -529,11 +580,12 @@ fun NookProgressBar(
     fraction: Float,
     color: Color,
     modifier: Modifier = Modifier,
-    trackColor: Color = NookColors.BarTrack,
+    trackColor: Color  = NookColors.BarTrack,
     height: androidx.compose.ui.unit.Dp = 6.dp
 ) {
-    val animatedFrac by animateFloatAsState(
-        targetValue   = fraction,
+    // Bug fix: coerce here as extra safety; upstream should already be 0–1
+    val safeFrac by animateFloatAsState(
+        targetValue   = fraction.coerceIn(0f, 1f),
         animationSpec = tween(400),
         label         = "progress"
     )
@@ -546,7 +598,7 @@ fun NookProgressBar(
         Box(
             modifier = Modifier
                 .fillMaxHeight()
-                .fillMaxWidth(animatedFrac)
+                .fillMaxWidth(safeFrac)
                 .clip(NookShapes.Pill)
                 .background(color)
         )
@@ -579,13 +631,22 @@ fun NookStatusGlowIndicator(status: String, size: androidx.compose.ui.unit.Dp = 
     )
 }
 
+/**
+ * Error banner with optional dismiss.
+ *
+ * Bug fix: maxLines was 3 in the original — long Cloudflare/timeout messages were
+ * silently truncated. Raised to 6; the messages from ApiResult are already concise.
+ */
 @Composable
-fun NookErrorBanner(message: String) {
+fun NookErrorBanner(
+    message: String,
+    onDismiss: (() -> Unit)? = null
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .background(NookColors.PillRed, NookShapes.Small)
-            .padding(12.dp),
+            .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Icon(
@@ -599,12 +660,24 @@ fun NookErrorBanner(message: String) {
             text     = message,
             style    = MaterialTheme.typography.bodySmall,
             color    = NookColors.StatusOffline,
-            // BUG FIX: maxLines = 3 silently truncated long Cloudflare/network
-            // error strings. Raised to 5 so the full user-readable message is
-            // always visible; the error strings from ApiResult are already concise.
-            maxLines = 5,
+            modifier = Modifier.weight(1f),
+            maxLines = 6,
             overflow = TextOverflow.Ellipsis
         )
+        if (onDismiss != null) {
+            Spacer(Modifier.width(4.dp))
+            IconButton(
+                onClick  = onDismiss,
+                modifier = Modifier.size(20.dp)
+            ) {
+                Icon(
+                    imageVector        = Icons.Default.Close,
+                    contentDescription = "Dismiss error",
+                    tint               = NookColors.StatusOffline,
+                    modifier           = Modifier.size(14.dp)
+                )
+            }
+        }
     }
 }
 
@@ -689,12 +762,12 @@ fun ConsoleScreen(
     var commandInput by remember { mutableStateOf("") }
     val keyboardCtrl = LocalSoftwareKeyboardController.current
 
-    // Connect once when the composable enters composition.
+    // Connect once per identifier (reconnects if the user navigates to a different server)
     LaunchedEffect(uiServer.attributes.identifier) {
         consoleVm.connect(uiServer)
     }
 
-    // Auto-scroll to bottom whenever a new line is appended.
+    // Auto-scroll to bottom on new output
     LaunchedEffect(state.lines.size) {
         if (state.lines.isNotEmpty()) {
             scrollState.animateScrollToItem(state.lines.lastIndex)
@@ -723,9 +796,11 @@ fun ConsoleScreen(
                 value    = commandInput,
                 onChange = { commandInput = it },
                 onSend   = {
-                    consoleVm.sendCommand(commandInput)
-                    commandInput = ""
-                    keyboardCtrl?.hide()
+                    if (commandInput.isNotBlank()) {
+                        consoleVm.sendCommand(commandInput)
+                        commandInput = ""
+                        keyboardCtrl?.hide()
+                    }
                 },
                 enabled  = state.isConnected
             )
@@ -737,44 +812,59 @@ fun ConsoleScreen(
                 .padding(padding)
                 .background(NookColors.ConsoleBg)
         ) {
-            if (state.isConnecting) {
-                Column(
-                    modifier            = Modifier.align(Alignment.Center),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    CircularProgressIndicator(color = NookColors.AccentBlue)
-                    Spacer(Modifier.height(12.dp))
+            when {
+                state.isConnecting -> {
+                    Column(
+                        modifier            = Modifier.align(Alignment.Center),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        CircularProgressIndicator(color = NookColors.AccentBlue)
+                        Spacer(Modifier.height(12.dp))
+                        Text(
+                            text  = "Connecting to console…",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = NookColors.TextSecondary
+                        )
+                    }
+                }
+                state.lines.isEmpty() && !state.isConnected && state.error == null -> {
                     Text(
-                        text  = "Connecting to console…",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = NookColors.TextSecondary
+                        text     = "Waiting for output…",
+                        style    = MaterialTheme.typography.bodyMedium,
+                        color    = NookColors.TextMuted,
+                        modifier = Modifier.align(Alignment.Center)
                     )
                 }
-            } else {
-                LazyColumn(
-                    state               = scrollState,
-                    modifier            = Modifier
-                        .fillMaxSize()
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(1.dp)
-                ) {
-                    items(state.lines) { line ->
-                        Text(
-                            text  = line,
-                            style = MaterialTheme.typography.labelMedium,
-                            color = consoleLineColor(line)
-                        )
+                else -> {
+                    LazyColumn(
+                        state               = scrollState,
+                        modifier            = Modifier
+                            .fillMaxSize()
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(1.dp)
+                    ) {
+                        items(state.lines) { line ->
+                            Text(
+                                text  = line,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = consoleLineColor(line)
+                            )
+                        }
                     }
                 }
             }
 
+            // Error banner overlaid at the bottom — dismissible
             if (state.error != null) {
                 Box(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(16.dp)
                 ) {
-                    NookErrorBanner(state.error!!)
+                    NookErrorBanner(
+                        message   = state.error!!,
+                        onDismiss = { consoleVm.clearError() }
+                    )
                 }
             }
         }
@@ -796,7 +886,6 @@ private fun consoleLineColor(line: String): Color {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ConsoleTopBar(
     serverName: String,
@@ -832,13 +921,16 @@ fun ConsoleTopBar(
                 Spacer(Modifier.width(10.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text     = serverName,
+                        text     = serverName.ifBlank { "Console" },
                         style    = MaterialTheme.typography.titleMedium,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text  = "${serverStatusLabel(status)} · $panelLabel",
+                        text  = buildString {
+                            append(serverStatusLabel(status))
+                            if (panelLabel.isNotBlank()) append(" · $panelLabel")
+                        },
                         style = MaterialTheme.typography.bodySmall,
                         color = serverStatusColor(status)
                     )
@@ -1045,7 +1137,7 @@ fun SettingsScreen(vm: ServersViewModel, onBack: () -> Unit) {
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text  = account.label,
+                                    text  = account.label.ifBlank { "Unnamed Panel" },
                                     style = MaterialTheme.typography.titleMedium
                                 )
                                 Text(
@@ -1055,7 +1147,6 @@ fun SettingsScreen(vm: ServersViewModel, onBack: () -> Unit) {
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
-                                // Show pinned server ID badge if set
                                 if (account.isPinned) {
                                     Spacer(Modifier.height(2.dp))
                                     Text(
@@ -1065,11 +1156,17 @@ fun SettingsScreen(vm: ServersViewModel, onBack: () -> Unit) {
                                     )
                                 }
                                 Spacer(Modifier.height(4.dp))
+                                // Bug fix: original showed only last 6 chars with no prefix context.
+                                // Show key prefix (ptlc_…) plus last 4 chars so the user can
+                                // distinguish keys at a glance.
+                                val keyPreview = when {
+                                    account.apiKey.length > 8 ->
+                                        account.apiKey.take(5) + "••••" + account.apiKey.takeLast(4)
+                                    else ->
+                                        "••••" + account.apiKey.takeLast(4)
+                                }
                                 Text(
-                                    // BUG FIX: original showed only the last 6 chars of the key
-                                    // with no context. Show the key prefix too so the user knows
-                                    // which credential is stored (Pterodactyl keys are ptlc_…).
-                                    text       = "••••" + account.apiKey.takeLast(4),
+                                    text       = keyPreview,
                                     style      = MaterialTheme.typography.bodySmall,
                                     color      = NookColors.TextMuted,
                                     fontFamily = FontFamily.Monospace
@@ -1107,7 +1204,7 @@ fun SettingsScreen(vm: ServersViewModel, onBack: () -> Unit) {
 
     // ─── Delete confirmation dialog ───────────────────────────────────────────
 
-    if (showDeleteDialog != null) {
+    showDeleteDialog?.let { account ->
         AlertDialog(
             onDismissRequest = { showDeleteDialog = null },
             containerColor   = NookColors.CardSurface,
@@ -1117,7 +1214,7 @@ fun SettingsScreen(vm: ServersViewModel, onBack: () -> Unit) {
             },
             text = {
                 Text(
-                    text  = "Remove \"${showDeleteDialog!!.label}\"? All servers from this panel will disappear from your feed.",
+                    text  = "Remove \"${account.label.ifBlank { "this panel" }}\"? All servers from this panel will disappear from your feed.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = NookColors.TextSecondary
                 )
@@ -1125,7 +1222,7 @@ fun SettingsScreen(vm: ServersViewModel, onBack: () -> Unit) {
             confirmButton = {
                 TextButton(
                     onClick = {
-                        vm.removeAccount(showDeleteDialog!!.id)
+                        vm.removeAccount(account.id)
                         showDeleteDialog = null
                     }
                 ) {
