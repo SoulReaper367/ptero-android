@@ -43,7 +43,7 @@ interface PterodactylApi {
      * "include=allocations" is a @Query so it remains a proper query parameter.
      * "per_page" is also a @Query so it can be overridden if needed.
      */
-    @GET("servers")
+    @GET("")
     suspend fun listServers(
         @Query("include")  include: String = "allocations",
         @Query("per_page") perPage: Int    = 50,
