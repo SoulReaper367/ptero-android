@@ -62,19 +62,11 @@ class ConsoleViewModel(application: Application) : AndroidViewModel(application)
                 val token     = res.data.data.token
                 openSocket(socketUrl, token, account.panelUrl)
             }
-            is ApiResult.Error -> {
+            else -> {
                 _state.update {
                     it.copy(
                         isConnecting = false,
-                        error = "Failed to get console token (HTTP ${res.code})"
-                    )
-                }
-            }
-            is ApiResult.NetworkError -> {
-                _state.update {
-                    it.copy(
-                        isConnecting = false,
-                        error = "Network error: ${res.cause.message}"
+                        error        = res.errorMessage ?: "Failed to get console token."
                     )
                 }
             }
@@ -90,13 +82,11 @@ class ConsoleViewModel(application: Application) : AndroidViewModel(application)
             listener  = object : WebSocketListener() {
 
                 override fun onOpen(webSocket: WebSocket, response: Response) {
-                    // Pterodactyl requires auth event immediately on open
                     val authEvent = gson.toJson(
                         WsOutboundEvent("auth", listOf(token))
                     )
                     webSocket.send(authEvent)
                     _state.update { it.copy(isConnecting = false, isConnected = true) }
-                    // Request initial log history
                     webSocket.send(gson.toJson(WsOutboundEvent("send logs", listOf(""))))
                 }
 
@@ -109,7 +99,6 @@ class ConsoleViewModel(application: Application) : AndroidViewModel(application)
                                 appendLine(line)
                             }
                             "token expiring" -> {
-                                // Re-fetch token before it expires
                                 viewModelScope.launch(Dispatchers.IO) {
                                     val account = currentAccount ?: return@launch
                                     val api = PterodactylApiFactory.getApi(
@@ -156,7 +145,7 @@ class ConsoleViewModel(application: Application) : AndroidViewModel(application)
 
     private fun appendLine(line: String) {
         _state.update { current ->
-            val newLines = (current.lines + line).takeLast(1_000) // cap at 1 000 lines
+            val newLines = (current.lines + line).takeLast(1_000)
             current.copy(lines = newLines)
         }
     }
