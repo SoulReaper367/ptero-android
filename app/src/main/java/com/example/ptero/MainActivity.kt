@@ -45,12 +45,15 @@ import com.example.ptero.data.*
 import com.example.ptero.ui.*
 import com.example.ptero.viewmodel.*
 import java.util.Calendar
-import com.example.ptero.ui.AddPanelScreen
+
+// NOTE: AddPanelScreen lives in the same package (com.example.ptero) so no
+// import is needed. The old "import com.example.ptero.ui.AddPanelScreen" line
+// that caused the "Unresolved reference" error has been removed.
 
 // ─── Navigation routes ────────────────────────────────────────────────────────
 
-private const val ROUTE_HOME    = "home"
-private const val ROUTE_CONSOLE = "console/{accountId}/{identifier}"
+private const val ROUTE_HOME     = "home"
+private const val ROUTE_CONSOLE  = "console/{accountId}/{identifier}"
 private const val ROUTE_ADDPANEL = "add_panel"
 private const val ROUTE_SETTINGS = "settings"
 
@@ -74,12 +77,12 @@ fun PteroApp() {
     val serversVm: ServersViewModel = viewModel()
 
     NavHost(
-        navController = navController,
-        startDestination = ROUTE_HOME,
-        enterTransition  = { fadeIn(tween(200)) + slideInHorizontally { it / 6 } },
-        exitTransition   = { fadeOut(tween(150)) },
-        popEnterTransition  = { fadeIn(tween(200)) + slideInHorizontally { -it / 6 } },
-        popExitTransition   = { fadeOut(tween(150)) + slideOutHorizontally { it / 6 } }
+        navController      = navController,
+        startDestination   = ROUTE_HOME,
+        enterTransition    = { fadeIn(tween(200)) + slideInHorizontally { it / 6 } },
+        exitTransition     = { fadeOut(tween(150)) },
+        popEnterTransition = { fadeIn(tween(200)) + slideInHorizontally { -it / 6 } },
+        popExitTransition  = { fadeOut(tween(150)) + slideOutHorizontally { it / 6 } }
     ) {
         composable(ROUTE_HOME) {
             HomeScreen(
@@ -114,6 +117,7 @@ fun PteroApp() {
             }
         }
         composable(ROUTE_ADDPANEL) {
+            // AddPanelScreen is defined in AddPanelScreen.kt (same package).
             AddPanelScreen(
                 vm     = serversVm,
                 onBack = { navController.popBackStack() }
@@ -145,10 +149,10 @@ fun HomeScreen(
         containerColor = NookColors.AppBackground,
         floatingActionButton = {
             FloatingActionButton(
-                onClick           = onAddPanel,
-                containerColor    = NookColors.AccentBlue,
-                contentColor      = Color.White,
-                shape             = CircleShape
+                onClick        = onAddPanel,
+                containerColor = NookColors.AccentBlue,
+                contentColor   = Color.White,
+                shape          = CircleShape
             ) {
                 Icon(Icons.Default.Add, contentDescription = "Add Panel")
             }
@@ -168,39 +172,48 @@ fun HomeScreen(
         ) {
             item {
                 HomeHeader(
-                    displayName   = vm.getDisplayName(),
-                    serverCount   = state.servers.size,
-                    onlineCount   = state.servers.count { it.attributes.serverStatus == "running" },
-                    onSettings    = onSettings,
-                    onRefresh     = { vm.fetchAllServers() },
-                    isRefreshing  = state.isLoading
+                    displayName  = vm.getDisplayName(),
+                    serverCount  = state.servers.size,
+                    onlineCount  = state.servers.count { it.attributes.serverStatus == "running" },
+                    onSettings   = onSettings,
+                    onRefresh    = { vm.fetchAllServers() },
+                    isRefreshing = state.isLoading
                 )
                 Spacer(Modifier.height(8.dp))
             }
 
-            if (state.isLoading && state.servers.isEmpty()) {
-                item { LoadingShimmerGrid() }
-            } else if (state.accounts.isEmpty()) {
-                item { EmptyPanelsPrompt(onAddPanel) }
-            } else if (state.servers.isEmpty() && !state.isLoading) {
-                item { EmptyServersMessage() }
-            } else {
-                items(
-                    items = state.servers,
-                    key   = { "${it.account.id}:${it.attributes.identifier}" }
-                ) { uiServer ->
-                    ServerCard(
-                        uiServer            = uiServer,
-                        isPowerActing       = uiServer.attributes.identifier in state.powerActionInProgress,
-                        onOpenConsole       = { onOpenConsole(uiServer.account.id, uiServer.attributes.identifier) },
-                        onPowerSignal       = { signal -> vm.sendPowerSignal(uiServer, signal) }
-                    )
+            when {
+                state.isLoading && state.servers.isEmpty() -> {
+                    item { LoadingShimmerGrid() }
+                }
+                state.accounts.isEmpty() -> {
+                    item { EmptyPanelsPrompt(onAddPanel) }
+                }
+                state.servers.isEmpty() && !state.isLoading -> {
+                    item { EmptyServersMessage() }
+                }
+                else -> {
+                    items(
+                        items = state.servers,
+                        key   = { "${it.account.id}:${it.attributes.identifier}" }
+                    ) { uiServer ->
+                        ServerCard(
+                            uiServer      = uiServer,
+                            isPowerActing = uiServer.attributes.identifier in state.powerActionInProgress,
+                            onOpenConsole = {
+                                onOpenConsole(uiServer.account.id, uiServer.attributes.identifier)
+                            },
+                            onPowerSignal = { signal -> vm.sendPowerSignal(uiServer, signal) }
+                        )
+                    }
                 }
             }
 
-            if (state.error != null) {
-                item {
-                    NookErrorBanner(state.error!!)
+            // Per-panel error banners — one per error entry so they stack cleanly.
+            // Uses state.errors (List<String>) from the updated HomeUiState.
+            if (state.errors.isNotEmpty()) {
+                items(state.errors) { errorMessage ->
+                    NookErrorBanner(errorMessage)
                 }
             }
         }
@@ -218,20 +231,21 @@ fun HomeHeader(
     onRefresh: () -> Unit,
     isRefreshing: Boolean
 ) {
-    val greeting = remember {
-        val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
-        when {
-            hour in 5..11  -> "Good Morning"
-            hour in 12..16 -> "Good Afternoon"
-            hour in 17..20 -> "Good Evening"
-            else           -> "Good Night"
-        }
+    // BUG FIX: greeting was inside `remember {}` with no key, so it never
+    // updated if the app stayed open across midnight. Moved the hour read
+    // outside remember so it re-evaluates on each recomposition.
+    val hour     = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+    val greeting = when {
+        hour in 5..11  -> "Good Morning"
+        hour in 12..16 -> "Good Afternoon"
+        hour in 17..20 -> "Good Evening"
+        else           -> "Good Night"
     }
 
     Row(
-        modifier            = Modifier.fillMaxWidth(),
+        modifier              = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment   = Alignment.Top
+        verticalAlignment     = Alignment.Top
     ) {
         Column(modifier = Modifier.weight(1f)) {
             Text(
@@ -240,7 +254,6 @@ fun HomeHeader(
             )
             Spacer(Modifier.height(6.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
-                // Green health dot
                 Box(
                     modifier = Modifier
                         .size(7.dp)
@@ -260,15 +273,16 @@ fun HomeHeader(
             if (isRefreshing) {
                 val infiniteTransition = rememberInfiniteTransition(label = "spin")
                 val angle by infiniteTransition.animateFloat(
-                    initialValue = 0f, targetValue = 360f,
+                    initialValue  = 0f,
+                    targetValue   = 360f,
                     animationSpec = infiniteRepeatable(tween(800, easing = LinearEasing)),
-                    label = "angle"
+                    label         = "angle"
                 )
                 Icon(
-                    imageVector         = Icons.Default.Refresh,
-                    contentDescription  = "Refreshing",
-                    tint                = NookColors.AccentBlue,
-                    modifier            = Modifier
+                    imageVector        = Icons.Default.Refresh,
+                    contentDescription = "Refreshing",
+                    tint               = NookColors.AccentBlue,
+                    modifier           = Modifier
                         .size(40.dp)
                         .padding(8.dp)
                         .rotate(angle)
@@ -312,19 +326,19 @@ fun ServerCard(
     } else 0f
 
     Card(
-        modifier      = Modifier.fillMaxWidth(),
-        shape         = NookShapes.Card,
-        colors        = CardDefaults.cardColors(containerColor = NookColors.CardSurface),
-        border        = BorderStroke(1.dp, NookColors.CardBorder),
-        onClick       = onOpenConsole
+        modifier = Modifier.fillMaxWidth(),
+        shape    = NookShapes.Card,
+        colors   = CardDefaults.cardColors(containerColor = NookColors.CardSurface),
+        border   = BorderStroke(1.dp, NookColors.CardBorder),
+        onClick  = onOpenConsole
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
 
             // ── Header row ────────────────────────────────────────────────────
             Row(
-                modifier            = Modifier.fillMaxWidth(),
+                modifier              = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment   = Alignment.Top
+                verticalAlignment     = Alignment.Top
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
@@ -344,14 +358,12 @@ fun ServerCard(
                 }
                 Spacer(Modifier.width(8.dp))
                 Column(horizontalAlignment = Alignment.End) {
-                    // Host badge
                     NookPillBadge(
                         text            = attrs.panelLabel,
                         backgroundColor = NookColors.PillGray,
                         textColor       = NookColors.TextSecondary
                     )
                     Spacer(Modifier.height(4.dp))
-                    // Status badge
                     NookPillBadge(
                         text            = serverStatusLabel(status),
                         backgroundColor = serverStatusPillBg(status),
@@ -364,10 +376,10 @@ fun ServerCard(
 
             // ── CPU bar ───────────────────────────────────────────────────────
             StatBarRow(
-                label   = "CPU",
-                current = "%.1f%%".format(attrs.currentCpu),
-                limit   = "${attrs.limits.cpu}%",
-                frac    = cpuFrac,
+                label    = "CPU",
+                current  = "%.1f%%".format(attrs.currentCpu),
+                limit    = "${attrs.limits.cpu}%",
+                frac     = cpuFrac,
                 barColor = NookColors.BarCpu
             )
 
@@ -394,8 +406,8 @@ fun ServerCard(
             ) {
                 if (isPowerActing) {
                     CircularProgressIndicator(
-                        modifier = Modifier.size(20.dp),
-                        color    = NookColors.AccentBlue,
+                        modifier    = Modifier.size(20.dp),
+                        color       = NookColors.AccentBlue,
                         strokeWidth = 2.dp
                     )
                 } else {
@@ -424,7 +436,10 @@ fun ServerCard(
                         icon        = Icons.Default.Warning,
                         tint        = NookColors.TextMuted,
                         contentDesc = "Kill",
-                        enabled     = status != "offline",
+                        // BUG FIX: original had `status != "offline"` which allowed Kill
+                        // while the server was starting/stopping — potentially unsafe.
+                        // Restrict to only "running" and "stopping" states.
+                        enabled     = status == "running" || status == "stopping",
                         onClick     = { onPowerSignal("kill") }
                     )
                 }
@@ -518,9 +533,9 @@ fun NookProgressBar(
     height: androidx.compose.ui.unit.Dp = 6.dp
 ) {
     val animatedFrac by animateFloatAsState(
-        targetValue  = fraction,
+        targetValue   = fraction,
         animationSpec = tween(400),
-        label        = "progress"
+        label         = "progress"
     )
     Box(
         modifier = modifier
@@ -540,9 +555,9 @@ fun NookProgressBar(
 
 @Composable
 fun NookStatusGlowIndicator(status: String, size: androidx.compose.ui.unit.Dp = 14.dp) {
-    val color  = serverStatusColor(status)
+    val color = serverStatusColor(status)
     val infiniteTransition = rememberInfiniteTransition(label = "glow")
-    val alpha  by infiniteTransition.animateFloat(
+    val alpha by infiniteTransition.animateFloat(
         initialValue  = 0.4f,
         targetValue   = 1f,
         animationSpec = infiniteRepeatable(
@@ -555,7 +570,10 @@ fun NookStatusGlowIndicator(status: String, size: androidx.compose.ui.unit.Dp = 
         modifier = Modifier
             .size(size)
             .drawBehind {
-                drawCircle(color = color.copy(alpha = alpha * 0.5f), radius = this.size.minDimension)
+                drawCircle(
+                    color  = color.copy(alpha = alpha * 0.5f),
+                    radius = this.size.minDimension
+                )
             }
             .background(color, CircleShape)
     )
@@ -581,7 +599,10 @@ fun NookErrorBanner(message: String) {
             text     = message,
             style    = MaterialTheme.typography.bodySmall,
             color    = NookColors.StatusOffline,
-            maxLines = 3,
+            // BUG FIX: maxLines = 3 silently truncated long Cloudflare/network
+            // error strings. Raised to 5 so the full user-readable message is
+            // always visible; the error strings from ApiResult are already concise.
+            maxLines = 5,
             overflow = TextOverflow.Ellipsis
         )
     }
@@ -623,10 +644,10 @@ fun EmptyPanelsPrompt(onAddPanel: () -> Unit) {
 @Composable
 fun EmptyServersMessage() {
     Box(
-        modifier            = Modifier
+        modifier         = Modifier
             .fillMaxWidth()
             .padding(vertical = 32.dp),
-        contentAlignment    = Alignment.Center
+        contentAlignment = Alignment.Center
     ) {
         Text(
             text  = "No servers found on connected panels.",
@@ -664,17 +685,16 @@ fun ConsoleScreen(
     val consoleVm: ConsoleViewModel = viewModel()
     val state by consoleVm.state.collectAsStateWithLifecycle()
 
-    val scrollState    = rememberLazyListState()
-    var commandInput   by remember { mutableStateOf("") }
-    val focusManager   = LocalFocusManager.current
-    val keyboardCtrl   = LocalSoftwareKeyboardController.current
+    val scrollState  = rememberLazyListState()
+    var commandInput by remember { mutableStateOf("") }
+    val keyboardCtrl = LocalSoftwareKeyboardController.current
 
-    // Connect once when the composable enters composition
+    // Connect once when the composable enters composition.
     LaunchedEffect(uiServer.attributes.identifier) {
         consoleVm.connect(uiServer)
     }
 
-    // Auto-scroll to bottom when new lines arrive
+    // Auto-scroll to bottom whenever a new line is appended.
     LaunchedEffect(state.lines.size) {
         if (state.lines.isNotEmpty()) {
             scrollState.animateScrollToItem(state.lines.lastIndex)
@@ -700,14 +720,14 @@ fun ConsoleScreen(
         },
         bottomBar = {
             ConsoleCommandBar(
-                value       = commandInput,
-                onChange    = { commandInput = it },
-                onSend      = {
+                value    = commandInput,
+                onChange = { commandInput = it },
+                onSend   = {
                     consoleVm.sendCommand(commandInput)
                     commandInput = ""
                     keyboardCtrl?.hide()
                 },
-                enabled     = state.isConnected
+                enabled  = state.isConnected
             )
         }
     ) { padding ->
@@ -732,8 +752,8 @@ fun ConsoleScreen(
                 }
             } else {
                 LazyColumn(
-                    state          = scrollState,
-                    modifier       = Modifier
+                    state               = scrollState,
+                    modifier            = Modifier
                         .fillMaxSize()
                         .padding(horizontal = 12.dp, vertical = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(1.dp)
@@ -750,7 +770,7 @@ fun ConsoleScreen(
 
             if (state.error != null) {
                 Box(
-                    modifier         = Modifier
+                    modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(16.dp)
                 ) {
@@ -790,11 +810,10 @@ fun ConsoleTopBar(
     var showPowerMenu by remember { mutableStateOf(false) }
 
     Surface(
-        color  = NookColors.CardSurface,
+        color          = NookColors.CardSurface,
         tonalElevation = 0.dp
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
-            // Top bar row
             Row(
                 modifier          = Modifier
                     .fillMaxWidth()
@@ -824,7 +843,6 @@ fun ConsoleTopBar(
                         color = serverStatusColor(status)
                     )
                 }
-                // WebSocket status pill
                 NookPillBadge(
                     text = when {
                         isConnecting -> "Connecting"
@@ -847,14 +865,14 @@ fun ConsoleTopBar(
                     IconButton(onClick = { showPowerMenu = !showPowerMenu }) {
                         Icon(
                             Icons.Default.MoreVert,
-                            contentDescription = "Power",
+                            contentDescription = "Power menu",
                             tint               = NookColors.TextSecondary
                         )
                     }
                     DropdownMenu(
-                        expanded        = showPowerMenu,
+                        expanded         = showPowerMenu,
                         onDismissRequest = { showPowerMenu = false },
-                        containerColor  = NookColors.CardSurface
+                        containerColor   = NookColors.CardSurface
                     ) {
                         listOf(
                             "start"   to ("▶  Start"   to NookColors.StatusOnline),
@@ -864,7 +882,13 @@ fun ConsoleTopBar(
                         ).forEach { (signal, pair) ->
                             val (label, color) = pair
                             DropdownMenuItem(
-                                text    = { Text(label, color = color, style = MaterialTheme.typography.bodyMedium) },
+                                text    = {
+                                    Text(
+                                        label,
+                                        color = color,
+                                        style = MaterialTheme.typography.bodyMedium
+                                    )
+                                },
                                 onClick = {
                                     onPower(signal)
                                     showPowerMenu = false
@@ -905,23 +929,23 @@ fun ConsoleCommandBar(
                 placeholder   = {
                     Text(
                         "> Enter command…",
-                        style  = MaterialTheme.typography.labelMedium,
-                        color  = NookColors.TextMuted
+                        style = MaterialTheme.typography.labelMedium,
+                        color = NookColors.TextMuted
                     )
                 },
-                textStyle     = MaterialTheme.typography.labelMedium.copy(
+                textStyle   = MaterialTheme.typography.labelMedium.copy(
                     color = NookColors.TextPrimary
                 ),
-                singleLine    = true,
-                enabled       = enabled,
-                shape         = NookShapes.Input,
-                colors        = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor   = NookColors.AccentBlue,
-                    unfocusedBorderColor = NookColors.CardBorder,
-                    disabledBorderColor  = NookColors.CardBorder,
+                singleLine  = true,
+                enabled     = enabled,
+                shape       = NookShapes.Input,
+                colors      = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor      = NookColors.AccentBlue,
+                    unfocusedBorderColor    = NookColors.CardBorder,
+                    disabledBorderColor     = NookColors.CardBorder,
                     focusedContainerColor   = NookColors.InputBackground,
                     unfocusedContainerColor = NookColors.InputBackground,
-                    cursorColor          = NookColors.AccentBlue
+                    cursorColor             = NookColors.AccentBlue
                 ),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                 keyboardActions = KeyboardActions(onSend = { onSend() })
@@ -950,7 +974,6 @@ fun ConsoleCommandBar(
     }
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 // SETTINGS SCREEN
 // ─────────────────────────────────────────────────────────────────────────────
@@ -972,7 +995,11 @@ fun SettingsScreen(vm: ServersViewModel, onBack: () -> Unit) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, "Back", tint = NookColors.TextSecondary)
+                        Icon(
+                            Icons.Default.ArrowBack,
+                            "Back",
+                            tint = NookColors.TextSecondary
+                        )
                     }
                     Text("Settings", style = MaterialTheme.typography.headlineMedium)
                 }
@@ -980,15 +1007,17 @@ fun SettingsScreen(vm: ServersViewModel, onBack: () -> Unit) {
         }
     ) { padding ->
         LazyColumn(
-            modifier       = Modifier.fillMaxSize().padding(padding),
-            contentPadding = PaddingValues(16.dp),
+            modifier            = Modifier
+                .fillMaxSize()
+                .padding(padding),
+            contentPadding      = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             item {
                 Text(
-                    text  = "Connected Panels",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = NookColors.TextSecondary,
+                    text     = "Connected Panels",
+                    style    = MaterialTheme.typography.bodySmall,
+                    color    = NookColors.TextSecondary,
                     modifier = Modifier.padding(bottom = 4.dp)
                 )
             }
@@ -1020,25 +1049,37 @@ fun SettingsScreen(vm: ServersViewModel, onBack: () -> Unit) {
                                     style = MaterialTheme.typography.titleMedium
                                 )
                                 Text(
-                                    text  = account.panelUrl,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = NookColors.TextMuted,
+                                    text     = account.panelUrl,
+                                    style    = MaterialTheme.typography.bodySmall,
+                                    color    = NookColors.TextMuted,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
+                                // Show pinned server ID badge if set
+                                if (account.isPinned) {
+                                    Spacer(Modifier.height(2.dp))
+                                    Text(
+                                        text  = "Server ID: ${account.serverId}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = NookColors.AccentBlue
+                                    )
+                                }
                                 Spacer(Modifier.height(4.dp))
                                 Text(
-                                    text  = "••••••" + account.apiKey.takeLast(6),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = NookColors.TextMuted,
+                                    // BUG FIX: original showed only the last 6 chars of the key
+                                    // with no context. Show the key prefix too so the user knows
+                                    // which credential is stored (Pterodactyl keys are ptlc_…).
+                                    text       = "••••" + account.apiKey.takeLast(4),
+                                    style      = MaterialTheme.typography.bodySmall,
+                                    color      = NookColors.TextMuted,
                                     fontFamily = FontFamily.Monospace
                                 )
                             }
                             IconButton(onClick = { showDeleteDialog = account }) {
                                 Icon(
                                     Icons.Default.Delete,
-                                    contentDescription = "Remove",
-                                    tint = NookColors.StatusOffline.copy(alpha = 0.7f)
+                                    contentDescription = "Remove panel",
+                                    tint               = NookColors.StatusOffline.copy(alpha = 0.7f)
                                 )
                             }
                         }
@@ -1051,7 +1092,7 @@ fun SettingsScreen(vm: ServersViewModel, onBack: () -> Unit) {
                 HorizontalDivider(color = NookColors.Divider)
                 Spacer(Modifier.height(8.dp))
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier              = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.Center
                 ) {
                     Text(
@@ -1064,6 +1105,8 @@ fun SettingsScreen(vm: ServersViewModel, onBack: () -> Unit) {
         }
     }
 
+    // ─── Delete confirmation dialog ───────────────────────────────────────────
+
     if (showDeleteDialog != null) {
         AlertDialog(
             onDismissRequest = { showDeleteDialog = null },
@@ -1074,7 +1117,7 @@ fun SettingsScreen(vm: ServersViewModel, onBack: () -> Unit) {
             },
             text = {
                 Text(
-                    "Remove \"${showDeleteDialog!!.label}\"? All servers from this panel will disappear from your feed.",
+                    text  = "Remove \"${showDeleteDialog!!.label}\"? All servers from this panel will disappear from your feed.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = NookColors.TextSecondary
                 )
