@@ -185,7 +185,18 @@ class ServersViewModel(application: Application) : AndroidViewModel(application)
                 )
             }
 
-            if (allServers.isNotEmpty()) startResourcePolling()
+            if (allServers.isNotEmpty()) {
+                // Fetch resource status immediately so the home screen shows live
+                // CPU/RAM/status on first paint — not after the first 8-second delay.
+                try {
+                    refreshAllResources()
+                } catch (e: Exception) {
+                    Log.e(TAG, "fetchAllServers: initial resource refresh failed", e)
+                }
+                // Start the periodic poll loop. The loop now delays AFTER the first
+                // tick, so it does not double-fetch immediately after launch.
+                startResourcePolling()
+            }
         }
     }
 
@@ -254,62 +265,111 @@ class ServersViewModel(application: Application) : AndroidViewModel(application)
     private fun startResourcePolling() {
         resourcePollJob?.cancel()
         resourcePollJob = viewModelScope.launch {
+            // Delay FIRST, then fetch. The immediate fetch on startup is done by
+            // fetchAllServers() before this loop starts, so the loop only needs
+            // to handle subsequent ticks. This avoids a double-fetch at t=0.
             while (isActive) {
                 delay(8_000L)
-                if (isActive) refreshAllResources()
+                if (isActive) {
+                    try {
+                        refreshAllResources()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "startResourcePolling: tick failed", e)
+                    }
+                }
             }
         }
     }
 
     /**
-     * Refreshes resource usage for every currently-displayed server.
+     * Fetches live resource stats (CPU, RAM, disk, status) for every server in
+     * the current list and publishes one atomic StateFlow update.
      *
-     * Bug fix: original used `coroutineScope { }` which propagates child failures
-     * to the parent — a single failing server could cancel the entire poll pass.
-     * Each async block now has its own try/catch so one server's error is silent
-     * and the rest still update.
-     *
-     * Bug fix: `uiServer.attributes.apply { ... }` mutated a shared object that
-     * could be read concurrently by the UI. We now build a proper replacement list
-     * and do a single atomic StateFlow update.
+     * Design decisions:
+     * - Uses [coroutineScope] (not viewModelScope.async) so that structured
+     *   concurrency is maintained inside a suspend function. Each child async has
+     *   its own try/catch, so a single failing server cannot cancel the others.
+     * - Builds a fresh [UiServer] copy for each server; never mutates the shared
+     *   [ServerAttributes] object that the UI may be reading simultaneously.
+     * - On a per-server API failure the stale [UiServer] is kept so the card
+     *   does not flicker to zeros. The failure is logged but NOT surfaced as a
+     *   banner error — poll failures are expected on transient network hiccups.
+     * - If ALL servers fail (e.g. complete offline), no StateFlow update is
+     *   emitted at all — the home screen retains its last good state.
      */
     private suspend fun refreshAllResources() {
-        val current = _uiState.value.servers
-        if (current.isEmpty()) return
+        val snapshot = _uiState.value.servers
+        if (snapshot.isEmpty()) return
 
-        val updated = current.map { uiServer ->
-            viewModelScope.async(Dispatchers.IO) {
-                try {
-                    val api = PterodactylApiFactory.getApi(
-                        uiServer.account.panelUrl,
-                        uiServer.account.apiKey
-                    )
-                    when (val res = safeApiCall { api.getServerResources(uiServer.attributes.identifier) }) {
-                        is ApiResult.Success -> {
-                            val res2     = res.data.attributes
-                            val newAttrs = uiServer.attributes.copy().also { copy ->
-                                copy.currentCpu         = res2.resources.cpuAbsolute
-                                copy.currentMemoryBytes = res2.resources.memoryBytes
-                                copy.currentDiskBytes   = res2.resources.diskBytes
-                                copy.serverStatus       = res2.currentState
-                                // Preserve injected meta
-                                copy.panelAccountId     = uiServer.attributes.panelAccountId
-                                copy.panelLabel         = uiServer.attributes.panelLabel
-                                copy.allocationDisplay  = uiServer.attributes.allocationDisplay
-                            }
-                            uiServer.copy(attributes = newAttrs)
-                        }
-                        // Silently keep stale data on poll failure to avoid flashing errors
-                        else -> uiServer
+        // coroutineScope propagates cancellation correctly inside a suspend fun.
+        // Each async child is individually guarded with try/catch so one failure
+        // does not cancel the rest.
+        val updated: List<UiServer> = coroutineScope {
+            snapshot.map { uiServer ->
+                async(Dispatchers.IO) {
+                    fetchResourcesForServer(uiServer)
+                }
+            }.awaitAll()
+        }
+
+        // Only emit an update when at least one server's data actually changed,
+        // to avoid unnecessary recompositions on the home screen.
+        if (updated != snapshot) {
+            _uiState.update { it.copy(servers = updated) }
+        }
+    }
+
+    /**
+     * Calls the /resources endpoint for [uiServer] and returns a new [UiServer]
+     * with updated stats, or the original [uiServer] unchanged on any failure.
+     *
+     * Separated from [refreshAllResources] so it can also be called directly
+     * after a power action without duplicating the error-handling logic.
+     */
+    private suspend fun fetchResourcesForServer(uiServer: UiServer): UiServer {
+        val identifier = uiServer.attributes.identifier
+        if (identifier.isBlank()) {
+            Log.w(TAG, "fetchResourcesForServer: blank identifier, skipping")
+            return uiServer
+        }
+        return try {
+            val api = PterodactylApiFactory.getApi(
+                uiServer.account.panelUrl,
+                uiServer.account.apiKey
+            )
+            when (val res = safeApiCall { api.getServerResources(identifier) }) {
+                is ApiResult.Success -> {
+                    val resAttrs = res.data.attributes
+                    // Build a fresh copy — never mutate the shared attributes object
+                    val newAttrs = uiServer.attributes.copy().also { a ->
+                        a.currentCpu         = resAttrs.resources.cpuAbsolute
+                        a.currentMemoryBytes = resAttrs.resources.memoryBytes
+                        a.currentDiskBytes   = resAttrs.resources.diskBytes
+                        a.serverStatus       = resAttrs.currentState
+                        // Preserve injected meta that is not part of the /resources response
+                        a.panelAccountId     = uiServer.attributes.panelAccountId
+                        a.panelLabel         = uiServer.attributes.panelLabel
+                        a.allocationDisplay  = uiServer.attributes.allocationDisplay
                     }
-                } catch (e: Exception) {
-                    Log.w(TAG, "refreshAllResources: error for ${uiServer.attributes.identifier}", e)
-                    uiServer   // keep stale
+                    uiServer.copy(attributes = newAttrs)
+                }
+                is ApiResult.HttpError -> {
+                    Log.w(TAG, "fetchResourcesForServer: HTTP ${res.code} for $identifier")
+                    uiServer  // keep stale
+                }
+                is ApiResult.NetworkError -> {
+                    Log.w(TAG, "fetchResourcesForServer: network error for $identifier: ${res.userMessage}")
+                    uiServer  // keep stale
+                }
+                is ApiResult.ParseError -> {
+                    Log.w(TAG, "fetchResourcesForServer: parse error for $identifier", res.cause)
+                    uiServer  // keep stale
                 }
             }
-        }.awaitAll()
-
-        _uiState.update { it.copy(servers = updated) }
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchResourcesForServer: unexpected error for $identifier", e)
+            uiServer  // keep stale
+        }
     }
 
     // ─── Power signals ────────────────────────────────────────────────────────
@@ -363,13 +423,26 @@ class ServersViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
 
-            // Brief delay for the panel to process the signal before we poll
+            // Brief delay for the panel to process the signal, then refresh
+            // ONLY this server's status — no need to hammer every server's
+            // /resources endpoint after a single power action.
             delay(1_500L)
 
             try {
-                refreshAllResources()
+                val refreshed = withContext(Dispatchers.IO) {
+                    fetchResourcesForServer(uiServer)
+                }
+                _uiState.update { state ->
+                    state.copy(
+                        servers = state.servers.map { s ->
+                            if (s.account.id == uiServer.account.id &&
+                                s.attributes.identifier == uiServer.attributes.identifier
+                            ) refreshed else s
+                        }
+                    )
+                }
             } catch (e: Exception) {
-                Log.e(TAG, "sendPowerSignal: refreshAllResources threw after power action", e)
+                Log.e(TAG, "sendPowerSignal: post-action resource refresh failed for ${uiServer.attributes.identifier}", e)
             }
 
             _uiState.update {
