@@ -86,19 +86,21 @@ class SecureStorage(private val context: Context) {
      * Returns all stored [PanelAccount]s, or an empty list if none exist or if
      * deserialisation fails.  Never throws.
      */
-    fun getAccounts(): List<PanelAccount> = try {
-        val json = prefs.getString(KEY_ACCOUNTS, null) ?: return emptyList()
-        if (json.isBlank()) return emptyList()
-        val type = object : TypeToken<List<PanelAccount>>() {}.type
-        gson.fromJson<List<PanelAccount>>(json, type)?.filterNotNull() ?: emptyList()
-    } catch (e: JsonSyntaxException) {
-        Log.e(TAG, "getAccounts: JSON parse error — clearing corrupt data", e)
-        // Wipe the corrupt entry so future calls don't keep failing
-        runCatching { prefs.edit().remove(KEY_ACCOUNTS).apply() }
-        emptyList()
-    } catch (e: Exception) {
-        Log.e(TAG, "getAccounts: unexpected error", e)
-        emptyList()
+    fun getAccounts(): List<PanelAccount> {
+        return try {
+            val json = prefs.getString(KEY_ACCOUNTS, null) ?: return emptyList()
+            if (json.isBlank()) return emptyList()
+            val type = object : TypeToken<List<PanelAccount>>() {}.type
+            gson.fromJson<List<PanelAccount>>(json, type)?.filterNotNull() ?: emptyList()
+        } catch (e: JsonSyntaxException) {
+            Log.e(TAG, "getAccounts: JSON parse error — clearing corrupt data", e)
+            // Wipe the corrupt entry so future calls don't keep failing
+            runCatching { prefs.edit().remove(KEY_ACCOUNTS).apply() }
+            emptyList()
+        } catch (e: Exception) {
+            Log.e(TAG, "getAccounts: unexpected error", e)
+            emptyList()
+        }
     }
 
     /**
@@ -108,24 +110,26 @@ class SecureStorage(private val context: Context) {
      *  - The account limit has been reached and [account] is not an update.
      *  - The underlying prefs write throws (rare but possible on low storage).
      */
-    fun saveAccount(account: PanelAccount): Result<Unit> = try {
-        val current = getAccounts().toMutableList()
-        val isUpdate = current.any { it.id == account.id }
+    fun saveAccount(account: PanelAccount): Result<Unit> {
+        return try {
+            val current = getAccounts().toMutableList()
+            val isUpdate = current.any { it.id == account.id }
 
-        if (!isUpdate && current.size >= MAX_ACCOUNTS) {
-            return Result.failure(
-                IllegalStateException("Maximum of $MAX_ACCOUNTS panel accounts reached.")
-            )
+            if (!isUpdate && current.size >= MAX_ACCOUNTS) {
+                return Result.failure(
+                    IllegalStateException("Maximum of $MAX_ACCOUNTS panel accounts reached.")
+                )
+            }
+
+            val index = current.indexOfFirst { it.id == account.id }
+            if (index >= 0) current[index] = account else current.add(account)
+
+            persistAccounts(current)
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Log.e(TAG, "saveAccount: failed to save account ${account.id}", e)
+            Result.failure(e)
         }
-
-        val index = current.indexOfFirst { it.id == account.id }
-        if (index >= 0) current[index] = account else current.add(account)
-
-        persistAccounts(current)
-        Result.success(Unit)
-    } catch (e: Exception) {
-        Log.e(TAG, "saveAccount: failed to save account ${account.id}", e)
-        Result.failure(e)
     }
 
     /**
