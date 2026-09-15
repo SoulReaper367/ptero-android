@@ -201,46 +201,52 @@ class ServersViewModel(application: Application) : AndroidViewModel(application)
      */
     private suspend fun fetchServersForAccount(
         account: PanelAccount
-    ): ApiResult<List<UiServer>> = try {
-        val api = PterodactylApiFactory.getApi(account.panelUrl, account.apiKey)
+    ): ApiResult<List<UiServer>> {
+        return try {
+            val api = PterodactylApiFactory.getApi(account.panelUrl, account.apiKey)
 
-        if (account.isPinned) {
-            val serverId = account.serverId ?: return ApiResult.HttpError(
-                code        = 0,
-                userMessage = "[${account.label}] Pinned account has no server ID set."
-            )
-            when (val result = safeApiCall { api.getServer(serverId) }) {
-                is ApiResult.Success -> {
-                    val uiServer = result.data.attributes
-                        .applyAccountMeta(account)
-                        .let { UiServer(it, account) }
-                    ApiResult.Success(listOf(uiServer))
-                }
-                else -> result
-            }
-        } else {
-            when (val result = safeApiCall { api.listServers() }) {
-                is ApiResult.Success -> {
-                    // Bug fix: use safeData() to handle null/empty data array
-                    val servers = result.data.safeData().mapNotNull { wrapper ->
-                        try {
-                            UiServer(wrapper.attributes.applyAccountMeta(account), account)
-                        } catch (e: Exception) {
-                            Log.w(TAG, "fetchServersForAccount: skipping malformed server", e)
-                            null
-                        }
+            if (account.isPinned) {
+                val serverId = account.serverId ?: return ApiResult.HttpError(
+                    code        = 0,
+                    userMessage = "[${account.label}] Pinned account has no server ID set."
+                )
+                when (val result = safeApiCall { api.getServer(serverId) }) {
+                    is ApiResult.Success -> {
+                        val uiServer = result.data.attributes
+                            .applyAccountMeta(account)
+                            .let { UiServer(it, account) }
+                        ApiResult.Success(listOf(uiServer))
                     }
-                    ApiResult.Success(servers)
+                    is ApiResult.HttpError    -> result
+                    is ApiResult.NetworkError -> result
+                    is ApiResult.ParseError   -> result
                 }
-                else -> result
+            } else {
+                when (val result = safeApiCall { api.listServers() }) {
+                    is ApiResult.Success -> {
+                        // Bug fix: use safeData() to handle null/empty data array
+                        val servers = result.data.safeData().mapNotNull { wrapper ->
+                            try {
+                                UiServer(wrapper.attributes.applyAccountMeta(account), account)
+                            } catch (e: Exception) {
+                                Log.w(TAG, "fetchServersForAccount: skipping malformed server", e)
+                                null
+                            }
+                        }
+                        ApiResult.Success(servers)
+                    }
+                    is ApiResult.HttpError    -> result
+                    is ApiResult.NetworkError -> result
+                    is ApiResult.ParseError   -> result
+                }
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchServersForAccount: unexpected error for ${account.label}", e)
+            ApiResult.NetworkError(
+                userMessage = "[${account.label}] Unexpected error: ${e.message ?: "unknown"}",
+                cause       = e
+            )
         }
-    } catch (e: Exception) {
-        Log.e(TAG, "fetchServersForAccount: unexpected error for ${account.label}", e)
-        ApiResult.NetworkError(
-            userMessage = "[${account.label}] Unexpected error: ${e.message ?: "unknown"}",
-            cause       = e
-        )
     }
 
     // ─── Resource polling ─────────────────────────────────────────────────────
